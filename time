@@ -1,0 +1,1 @@
+alias date='date "+%a %b %d %H:%M:%S %Z %Y"'
