@@ -269,7 +269,8 @@ install_sing-box() {
   else
     download_sing-box
   fi
-#  download_config
+
+  config_sing-box
 
   if [[ ! -f "${DOWNLAOD_PATH}/sing-box-${SING_BOX_VERSION}-linux-${OS_ARCH}.tar.gz" ]]; then
     clear_sing_box
@@ -444,4 +445,372 @@ disable_sing-box() {
   else
     LOGE "取消sing-box开机自启失败"
   fi
+}
+
+#show logs
+show_log() {
+  confirm "确认是否已在配置中开启日志记录,默认开启" "y"
+  if [[ $? -ne 0 ]]; then
+    LOGI "将从console中读取日志:"
+    journalctl -u sing-box.service -e --no-pager -f
+  else
+    local tempLog=''
+    read -p "将从日志文件中读取日志,请输入日志文件路径,直接回车将使用默认路径": tempLog
+    if [[ -n ${tempLog} ]]; then
+      LOGI "日志文件路径:${tempLog}"
+      if [[ -f ${tempLog} ]]; then
+        tail -f ${tempLog} -s 3
+      else
+        LOGE "${tempLog}不存在,请确认配置"
+      fi
+    else
+      LOGI "日志文件路径:${DEFAULT_LOG_FILE_SAVE_PATH}"
+      tail -f ${DEFAULT_LOG_FILE_SAVE_PATH} -s 3
+    fi
+  fi
+}
+
+#clear log,the paremter is log file path
+clear_log() {
+  local filePath=''
+  if [[ $# -gt 0 ]]; then
+    filePath=$1
+  else
+    read -p "请输入日志文件路径": filePath
+    if [[ ! -n ${filePath} ]]; then
+      LOGI "输入的日志文件路径无效,将使用默认的文件路径"
+      filePath=${DEFAULT_LOG_FILE_SAVE_PATH}
+    fi
+  fi
+  LOGI "日志路径为:${filePath}"
+  if [[ ! -f ${filePath} ]]; then
+    LOGE "清除sing-box 日志文件失败,${filePath}不存在,请确认"
+    exit 1
+  fi
+  fileSize=$(ls -la ${filePath} --block-size=M | awk '{print $5}' | awk -F 'M' '{print$1}')
+  if [[ ${fileSize} -gt ${DEFAULT_LOG_FILE_DELETE_TRIGGER} ]]; then
+    rm $1 && systemctl restart sing-box
+    if [[ $? -ne 0 ]]; then
+      LOGE "清除sing-box 日志文件失败"
+    else
+      LOGI "清除sing-box 日志文件成功"
+    fi
+  else
+    LOGI "当前日志大小为${fileSize}M,小于${DEFAULT_LOG_FILE_DELETE_TRIGGER}M,将不会清除"
+  fi
+}
+
+config_Shadowsocks(){
+  echo ""
+  read -p " 请输入Shadowsocks端口[100-65535的一个数字，默认54321]：" port
+  [[ -z "${port}" ]] && port=54321
+  if [[ "${port:0:1}" = "0" ]]; then
+    LOGE "端口不能以0开头"
+    exit 1
+  fi
+  LOGI "  Shadowsocks端口：$port"
+
+  echo ""
+  echo "数据加密方式："
+  echo -e " ${red}1. 2022-blake3-aes-128-gcm${plain}"
+  echo -e " ${red}2. chacha20-ietf-poly1305${plain}"      
+  echo ""
+  
+  read -p "请加密类型，默认为1：" method_type
+  [[ -z "${method_type}" ]] && method_type=1
+
+  case $method_type in
+  1)
+    method="2022-blake3-aes-128-gcm"
+    password=`cat openssl rand -base64 16`
+    ;;
+  2)
+    method="chacha20-ietf-poly1305"
+    password=`cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1`
+    ;;
+  *)
+    LOGE " 请输入正确的选项！"
+    exit 1
+  esac
+
+  LOGI "加密类型：$method"
+  LOGI "密码：$password"
+
+  cat > ${CONFIG_FILE_PATH}/config.json <<-EOF
+{
+  "log": {
+    "disabled": false,
+    "level": "info",
+    "output": "/usr/local/sing-box/sing-box.log",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "google-tls",
+        "address": "local",
+        "address_strategy": "prefer_ipv4",
+        "strategy": "ipv4_only",
+        "detour": "direct"
+      },
+      {
+        "tag": "google-udp",
+        "address": "8.8.4.4",
+        "address_strategy": "prefer_ipv4",
+        "strategy": "prefer_ipv4",
+        "detour": "direct"
+      }
+    ],
+    "strategy": "prefer_ipv4",
+    "disable_cache": false,
+    "disable_expire": false
+  },
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "0.0.0.0",
+      "listen_port": ${port},
+      "method": "${method}",
+      "password": "${password}",
+      "network": "tcp",
+      "domain_strategy": "prefer_ipv4",
+      "tcp_fast_open": true,
+      "sniff": true,
+      "proxy_protocol": false
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "dns-out"
+      },
+      {
+        "inbound": ["ss-in"],
+        "network": "tcp",
+        "outbound": "direct"
+      },
+      {
+        "geosite": "category-ads-all",
+        "outbound": "block"
+      },
+      {
+        "geosite": "cn",
+        "geoip": "cn",
+        "outbound": "block"
+      }
+    ],
+    "geoip": {
+      "path": "geoip.db",
+      "download_url": "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db",
+      "download_detour": "direct"
+    },
+    "geosite": {
+      "path": "geosite.db",
+      "download_url": "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db",
+      "download_detour": "direct"
+    },
+    "final": "direct",
+    "auto_detect_interface": true
+  }
+}
+EOF
+
+}
+
+config_ShadowTLS(){
+  echo ""
+  read -p " 请输入ShadowTLS端口[100-65535的一个数字，默认443]：" port
+  [[ -z "${port}" ]] && port=443
+  if [[ "${port:0:1}" = "0" ]]; then
+    LOGE "端口不能以0开头"
+    exit 1
+  fi
+  LOGI "  ShadowTLS端口：$port"
+
+  echo ""
+  echo "数据加密方式："
+  echo -e " ${red}1. 2022-blake3-aes-128-gcm${plain}"
+  echo -e " ${red}2. chacha20-ietf-poly1305${plain}"      
+  echo ""
+  
+  read -p "请加密类型，默认为1：" method_type
+  [[ -z "${method_type}" ]] && method_type=1
+
+  case $method_type in
+  1)
+    method="2022-blake3-aes-128-gcm"
+    password=`cat openssl rand -base64 16`
+    ;;
+  2)
+    method="chacha20-ietf-poly1305"
+    password=`cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1`
+    ;;
+  *)
+    LOGE " 请输入正确的选项！"
+    exit 1
+  esac
+
+  LOGI "加密类型：$method"
+  LOGI "密码：$password"
+
+  echo ""
+  read -p " 请输入handshake域名[默认为：www.bing.com]：" handshake_server
+  [[ -z "${handshake_server}" ]] && handshake_server="www.bing.com"
+  echo ""
+
+  echo ""
+  read -p " 请输入handshake端口[默认为：443]：" handshake_port
+  [[ -z "${handshake_port}" ]] && handshake_port=443
+  echo ""
+
+  LOGI "handshake域名：$handshake_server"
+  LOGI "handshake端口：$handshake_port"
+
+  cat > ${CONFIG_FILE_PATH}/config.json <<-EOF
+{
+  "log": {
+    "disabled": false,
+    "level": "info",
+    "output": "/usr/local/sing-box/sing-box.log",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "google-tls",
+        "address": "local",
+        "address_strategy": "prefer_ipv4",
+        "strategy": "ipv4_only",
+        "detour": "direct"
+      },
+      {
+        "tag": "google-udp",
+        "address": "8.8.4.4",
+        "address_strategy": "prefer_ipv4",
+        "strategy": "prefer_ipv4",
+        "detour": "direct"
+      }
+    ],
+    "strategy": "prefer_ipv4",
+    "disable_cache": false,
+    "disable_expire": false
+  },
+  "inbounds": [
+    {
+      "type": "shadowtls",
+      "listen_port": ${port},
+      "handshake": {
+        "server": "${handshake_server}",
+        "server_port": ${handshake_port} 
+      },
+      "detour": "shadowsocks-in"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "shadowsocks-in",
+      "listen": "127.0.0.1",
+      "method": "${method}",
+      "password": "${password}"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "dns",
+      "tag": "dns-out"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "outbound": "dns-out"
+      },
+      {
+        "geosite": "category-ads-all",
+        "outbound": "block"
+      },
+      {
+        "geosite": "cn",
+        "geoip": "cn",
+        "outbound": "block"
+      }
+    ],
+    "geoip": {
+      "path": "geoip.db",
+      "download_url": "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db",
+      "download_detour": "direct"
+    },
+    "geosite": {
+      "path": "geosite.db",
+      "download_url": "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db",
+      "download_detour": "direct"
+    },
+    "final": "direct",
+    "auto_detect_interface": true
+  }
+}
+EOF
+}
+
+config_sing-box(){
+  LOGD "开始进行sing-box配置..."
+
+  if [[ -f "${CONFIG_FILE_PATH}/config.json" ]]; then
+    mv -f ${CONFIG_FILE_PATH}/config.json ${CONFIG_FILE_PATH}/config.json.bak
+  fi
+  
+  echo ""
+  echo "可配置类型："
+  echo -e " ${red}1. Shadowsocks${plain}"
+  echo -e " ${red}2. ShadowTLS${plain}"
+  echo -e " ${red}3. Trojan${plain}"
+  echo ""
+  
+  read -p "请选择配置类型，默认为1：" BOX_TYPE
+  [[ -z "${BOX_TYPE}" ]] && BOX_TYPE=1
+  LOGI "类型为：$BOX_TYPE"
+
+  case $BOX_TYPE in
+  1)
+    config_Shadowsocks
+    ;;
+  2)
+    config_ShadowTLS
+    ;;
+  3)
+    config_Trojan
+    ;;
+  *)
+    LOGE " 请输入正确的选项！"
+    exit 1
+  esac
+
+
+
+
+
 }
