@@ -556,7 +556,7 @@ config_Shadowsocks(){
   case $method_type in
   1)
     method="2022-blake3-aes-128-gcm"
-    password=`cat openssl rand -base64 16`
+    password=`openssl rand -base64 16`
     ;;
   2)
     method="chacha20-ietf-poly1305"
@@ -691,7 +691,7 @@ config_ShadowTLS(){
   case $method_type in
   1)
     method="2022-blake3-aes-128-gcm"
-    password=`cat openssl rand -base64 16`
+    password=`openssl rand -base64 16`
     ;;
   2)
     method="chacha20-ietf-poly1305"
