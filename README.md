@@ -7,7 +7,7 @@
 * trojan-go搭建
 * sing-box搭建（支持Shadowsocks、ShadowTLS、Trojan一键配置）
 * 流媒体检测
-* 回城线路测试
+* 回程线路测试
 * 三网下载测试
 
 ### 使用
