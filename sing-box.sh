@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_YES_VERSION='1.0.5'
+SING_BOX_YES_VERSION='1.0.6'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -1160,7 +1160,7 @@ getCert() {
 
   CERT_FILE="${CONFIG_FILE_PATH}/${domain}.pem"
   KEY_FILE="${CONFIG_FILE_PATH}/${domain}.key"
-  ~/.acme.sh/acme.sh --install-cert -d $DOMAIN --ecc \
+  ~/.acme.sh/acme.sh --install-cert -d $domain --ecc \
     --key-file       $KEY_FILE  \
     --fullchain-file $CERT_FILE \
     --reloadcmd     "service nginx force-reload"
@@ -1400,11 +1400,14 @@ showInfo() {
   fi
 }
 
+remove_shell(){
+  rm -rf ${SCRIPT_FILE_PATH}
+}
+
 show_menu() {
   echo -e "
   ${green}sing-box-v${SING_BOX_YES_VERSION} 管理脚本${plain}
   ${green}0.${plain} 退出脚本
-————————————————
   ${green}1.${plain} 安装 sing-box 服务
   ${green}2.${plain} 更新 sing-box 服务
   ${green}3.${plain} 卸载 sing-box 服务
@@ -1434,7 +1437,7 @@ show_menu() {
     update_sing-box && show_menu
     ;;
   3)
-    uninstall_sing-box && show_menu
+    uninstall_sing-box && remove_shell
     ;;
   4)
     start_sing-box && show_menu
