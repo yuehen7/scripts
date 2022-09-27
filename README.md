@@ -15,3 +15,8 @@
 ```
 wget -N --no-check-certificate https://raw.githubusercontent.com/yuehen7/scripts/main/main.sh && chmod +x main.sh && bash main.sh
 ```
+
+# 致谢  
+[FranzKafkaYu/sing-box-yes](https://github.com/FranzKafkaYu/sing-box-yes)
+<br/>
+[SagerNet/sing-box](https://github.com/SagerNet/sing-box)  
