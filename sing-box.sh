@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_YES_VERSION='1.0.7'
+SING_BOX_YES_VERSION='1.0.8'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -1000,9 +1000,6 @@ module_hotfixes=true' > /etc/yum.repos.d/nginx.repo
   config_Nginx
 
   LOGD "开始配置config.json..."
-  if [[ ! -f /usr/local/etc/sing-box/config.json.bak ]]; then
-    mv /usr/local/etc/sing-box/config.json /usr/local/etc/sing-box/config.json.bak
-  fi
   cat > /usr/local/etc/sing-box/config.json <<-EOF
 {
   "log": {
