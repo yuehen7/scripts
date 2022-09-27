@@ -778,11 +778,6 @@ config_ShadowTLS(){
       "tag": "direct"
     },
     {
-      "inbound": ["shadowtls-in"],
-      "network": "tcp",
-      "outbound": "direct"
-    },
-    {
       "type": "block",
       "tag": "block"
     },
@@ -796,6 +791,11 @@ config_ShadowTLS(){
       {
         "protocol": "dns",
         "outbound": "dns-out"
+      },
+      {
+      	"inbound": ["shadowtls-in"],
+	"network": "tcp",
+	"outbound": "direct"
       },
       {
         "geosite": "category-ads-all",
