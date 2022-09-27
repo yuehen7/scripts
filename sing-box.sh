@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_YES_VERSION='1.0.6'
+SING_BOX_YES_VERSION='1.0.7'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -153,10 +153,9 @@ set_as_entrance() {
 }
 
 update_shell(){
-   sh_new_ver=$(wget --no-check-certificate -qO- -t1 -T3 "https://raw.githubusercontent.com/yuehen7/scripts/main/main.sh"|grep 'sh_ver="'|awk -F "=" '{print $NF}'|sed 's/\"//g'|head -1) && sh_new_type="github"
-   [[ -z ${sh_new_ver} ]] && echo -e "${Error} 无法链接到 Github !" && exit 0
-   wget -N --no-check-certificate "https://raw.githubusercontent.com/yuehen7/scripts/main/main.sh" && chmod +x main.sh
-   echo -e "脚本已更新为最新版本[ ${sh_new_ver} ] !(注意：因为更新方式为直接覆盖当前运行的脚本，所以可能下面会提示一些报错，无视即可)" && exit 0
+  wget --no-check-certificate -O ${SCRIPT_FILE_PATH} https://raw.githubusercontent.com/yuehen7/scripts/main/sing-box.sh
+  chmod +x ${SCRIPT_FILE_PATH}
+  echo -e "脚本已更新..." && exit 0
 }
 
 show_status() {
@@ -1422,6 +1421,8 @@ show_menu() {
   ${green}C.${plain} 设置 sing-box 开机自启
   ${green}D.${plain} 取消 sing-box 开机自启
   ${green}E.${plain} 查看 sing-box 配置
+  ${green}F.${plain} 升级脚本
+  ${green}G.${plain} 删除脚本
  "
   show_status
   echo && read -p "请输入选择[0-E]:" num
@@ -1437,7 +1438,7 @@ show_menu() {
     update_sing-box && show_menu
     ;;
   3)
-    uninstall_sing-box && remove_shell
+    uninstall_sing-box && show_menu
     ;;
   4)
     start_sing-box && show_menu
@@ -1471,6 +1472,12 @@ show_menu() {
     ;;   
   E)
     showInfo
+    ;;     
+  F)
+    update_shell
+    ;; 
+  G)
+    remove_shell
     ;;        
   *)
     LOGE "请输入正确的选项 [0-G]"
