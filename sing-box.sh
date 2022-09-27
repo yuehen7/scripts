@@ -983,8 +983,8 @@ module_hotfixes=true' > /etc/yum.repos.d/nginx.repo
   fi
   systemctl enable nginx
 
-  getCert()
-  config_Nginx()
+  getCert
+  config_Nginx
 
   LOGD "开始配置config.json..."
   if [[ ! -f /usr/local/etc/sing-box/config.json.bak ]]; then
