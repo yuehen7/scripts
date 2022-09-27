@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_YES_VERSION='1.0.2'
+SING_BOX_YES_VERSION='1.0.3'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -38,6 +38,8 @@ SERVICE_FILE_PATH='/etc/systemd/system/sing-box.service'
 
 #log file save path
 DEFAULT_LOG_FILE_SAVE_PATH='/usr/local/sing-box/sing-box.log'
+
+NGINX_CONF_PATH="/etc/nginx/conf.d/"
 
 #sing-box status define
 declare -r SING_BOX_STATUS_RUNNING=1
@@ -356,7 +358,13 @@ uninstall_sing-box() {
     elif [[ ${OS_RELEASE} == "centos" ]]; then
       yum remove nginx
     fi
-    rm -rf /etc/nginx
+
+    rm -rf /etc/nginx/nginx.conf
+    if [[ -f /etc/nginx/nginx.conf.bak ]]; then
+      mv /etc/nginx/nginx.conf.bak /etc/nginx/nginx.conf
+    fi
+    
+    rm -rf $NGINX_CONF_PATH${domain}.conf
     rm -rf /usr/share/nginx
     ~/.acme.sh/acme.sh --uninstall
     rm -rf ~/.acme.sh
@@ -1167,13 +1175,16 @@ config_Nginx() {
   LOGD "开始配置nginx..."
   
   systemctl stop nginx
-  NGINX_CONF_PATH="/etc/nginx/conf.d/"
   mkdir -p /usr/share/nginx/html
 
   echo 'User-Agent: *' > /usr/share/nginx/html/robots.txt
   echo 'Disallow: /' >> /usr/share/nginx/html/robots.txt
   ROBOT_CONFIG="    location = /robots.txt {}"
 
+  if [[ ! -f /etc/nginx/nginx.conf.bak ]]; then
+    mv /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
+  fi
+  
   res=`id nginx 2>/dev/null`
   if [[ "$?" != "0" ]]; then
     user="www-data"
