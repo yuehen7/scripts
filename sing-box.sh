@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_YES_VERSION='1.0.8'
+SING_BOX_YES_VERSION='1.0.9'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -1060,7 +1060,7 @@ module_hotfixes=true' > /etc/yum.repos.d/nginx.repo
         "http/2": {
           "server": "127.0.0.1",
           "server_port": 80
-        },
+        }
       },
       "transport": {
         "type": "ws",
