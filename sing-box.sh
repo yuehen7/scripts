@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_YES_VERSION='1.0.0'
+SING_BOX_YES_VERSION='1.0.1'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -752,7 +752,7 @@ config_ShadowTLS(){
   "inbounds": [
     {
       "type": "shadowtls",
-      "tag": "sstls-in",
+      "tag": "shadowtls-in",
       "listen": "::",
       "listen_port": ${port},
       "handshake": {
@@ -775,7 +775,7 @@ config_ShadowTLS(){
       "tag": "direct"
     },
     {
-      "inbound": ["sstls-in"],
+      "inbound": ["shadowtls-in"],
       "network": "tcp",
       "outbound": "direct"
     },
