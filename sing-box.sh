@@ -144,8 +144,11 @@ config_check() {
 }
 
 set_as_entrance() {
+  LOGI "脚本版本监测..."
   sh_new_ver=$(wget --no-check-certificate -qO- -t1 -T3 "https://raw.githubusercontent.com/yuehen7/scripts/main/sing-box.sh"|grep 'SING_BOX_YES_VERSION="'|awk -F "=" '{print $NF}'|sed 's/\"//g'|head -1) && sh_new_type="github"
-  if [[ ! -f "${SCRIPT_FILE_PATH}" || ! ${sh_new_ver} == ${SING_BOX_YES_VERSION} ]]; then
+  echo ""
+  if [[ ! -f "${SCRIPT_FILE_PATH}" || ! ${sh_new_ver} = ${SING_BOX_YES_VERSION} ]]; then
+    LOGI "自动更新脚本..."
     wget --no-check-certificate -O ${SCRIPT_FILE_PATH} https://raw.githubusercontent.com/yuehen7/scripts/main/sing-box.sh
     chmod +x ${SCRIPT_FILE_PATH}
   fi
