@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_YES_VERSION='1.0.9'
+SING_BOX_YES_VERSION='1.0.10'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -1422,7 +1422,7 @@ show_menu() {
   ${green}G.${plain} 删除脚本
  "
   show_status
-  echo && read -p "请输入选择[0-E]:" num
+  echo && read -p "请输入选择[0-G]:" num
 
   case "${num}" in
   0)
