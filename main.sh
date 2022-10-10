@@ -2,7 +2,7 @@
 PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
-sh_ver="1.0.0"
+sh_ver="1.0.1"
 
 #0升级脚本
 update_shell(){
@@ -71,7 +71,7 @@ echo && echo -e "
 " && echo
 
 echo
-read -e -p " 请输入数字 [0-6]:" num
+read -e -p " 请输入数字 [0-8]:" num
 case "$num" in
 	0)
 	update_shell
