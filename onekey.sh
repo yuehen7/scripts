@@ -275,7 +275,7 @@ clear_sing_box() {
 
 uninstall_sing-box() {
   echo ""
-  LOGI "配置类型为trojan，开始卸载nginx..."
+  LOGI "开始卸载nginx..."
   systemctl stop nginx
   systemctl disable nginx
   if [[ ${OS_RELEASE} == "ubuntu" || ${OS_RELEASE} == "debian" ]]; then
