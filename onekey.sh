@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_ONEKEY_VERSION='1.0.2'
+SING_BOX_ONEKEY_VERSION='1.0.7'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -38,8 +38,6 @@ SERVICE_FILE_PATH='/etc/systemd/system/sing-box.service'
 
 #log file save path
 DEFAULT_LOG_FILE_SAVE_PATH='/usr/local/sing-box/sing-box.log'
-
-NGINX_CONF_PATH="/etc/nginx/conf.d/"
 
 #sing-box status define
 declare -r SING_BOX_STATUS_RUNNING=1
@@ -274,13 +272,12 @@ clear_sing_box() {
 }
 
 uninstall_Nginx() {
-  echo ""
   LOGI "开始卸载nginx..."
   systemctl stop nginx
-  systemctl disable nginx
+  sleep 2s
   if [[ ${OS_RELEASE} == "ubuntu" || ${OS_RELEASE} == "debian" ]]; then
-    apt remove nginx -y
-    apt remove nginx-common -y
+    apt autoremove nginx-common -y
+    apt autoremove nginx -y
   elif [[ ${OS_RELEASE} == "centos" ]]; then
     yum remove nginx -y
   fi
@@ -291,8 +288,7 @@ uninstall_Nginx() {
   fi
 
   ~/.acme.sh/acme.sh --uninstall
-  rm -rf $NGINX_CONF_PATHalone.conf && rm -rf /usr/share/nginx && rm -rf ~/.acme.sh
-
+  rm -rf /etc/nginx/conf.d/alone.conf && rm -rf /usr/share/nginx && rm -rf ~/.acme.sh
   LOGI "nginx及acme.sh卸载完成."
 }
 
@@ -367,8 +363,6 @@ stop_sing-box() {
 }
 
 install_sing-box() {
-  install_Nginx
-
   LOGD "开始安装sing-box..."
   if [[ $# -ne 0 ]]; then
     download_sing-box $1
@@ -454,9 +448,7 @@ enable_sing-box() {
 
 create_Cert() {
   LOGD "开始获取证书..."
-  systemctl stop nginx
   sleep 2s
-
   res=`ss -ntlp| grep -E ':80 |:443 '`
   if [[ "${res}" != "" ]]; then
     LOGE "其他进程占用了80或443端口，请先关闭再运行一键脚本${plain}"
@@ -582,10 +574,10 @@ http {
 }
 EOF
 
-  mkdir -p $NGINX_CONF_PATH
+  mkdir -p /etc/nginx/conf.d
 
   if [[ "${tlsFlag}" == "y" ]]; then
-    cat > $NGINX_CONF_PATHalone.conf<<-EOF
+    cat > /etc/nginx/conf.d/alone.conf <<-EOF
 server {
   listen 80;
   listen [::]:80;
@@ -632,11 +624,11 @@ server {
 }
 EOF
   else
-    cat > $NGINX_CONF_PATHalone.conf<<-EOF
+    cat > /etc/nginx/conf.d/alone.conf <<-EOF
 server {
   listen ${port};
+  listen [::]:${port};
   server_name ${domain};
-
   root /usr/share/nginx/html;
 
   location /vmess {
@@ -684,45 +676,47 @@ config_sing-box(){
   fi
 
   echo ""
-  echo " 请检查是否满足以下条件："
-  echo -e " ${red}1.一个伪装域名${plain}"
-  echo -e " ${red}2.伪装域名DNS解析指向当前服务器ip（${ip}）${plain}"
-  echo ""
-  read -p " 确认满足按y，按其他退出脚本：" answer
-
-  if [[ "${answer,,}" != "y" ]]; then
-    exit 0
-  fi
-
-  echo ""
-  while true
-  do
-    read -p " 请输入伪装域名：" domain
-    if [[ -z "${domain}" ]]; then
-      LOGE "伪装域名输入错误，请重新输入！${plain}"
-    else
-      break
-    fi
-  done
-  LOGI "伪装域名(host)：$domain"
-
-  echo ""
-  domain=${domain,,}
-  resolve=`curl -sL https://lefu.men/hostip.php?d=${domain}`
-  res=`echo -n ${resolve} | grep ${ip}`
-  if [[ -z "${res}" ]]; then
-    echo " ${domain} 解析结果：${resolve}"
-    LOGE "伪装域名未解析到当前服务器IP(${ip})!${plain}"
-    exit 1
-  fi
-
-  echo ""
-  read -p " 是否开启TLS(y/n)[默认为:y]：" tlsFlag
+  read -p " 是否启用TLS(y/n)[默认为:y]：" tlsFlag
   [[ -z "${tlsFlag}" ]] && tlsFlag="y"
   LOGI " 开启tls：$tlsFlag"
 
+  if [[ "${tlsFlag}" == "y" ]]; then
+    echo ""
+    echo " 请检查是否满足以下条件："
+    echo -e " ${red}1.一个伪装域名${plain}"
+    echo -e " ${red}2.伪装域名DNS解析指向当前服务器ip（${ip}）${plain}"
+    echo ""
+    read -p " 确认满足按y，按其他退出脚本：" answer
+
+    if [[ "${answer,,}" != "y" ]]; then
+      exit 0
+    fi
+
+    echo ""
+    while true
+    do
+      read -p " 请输入伪装域名：" domain
+      if [[ -z "${domain}" ]]; then
+        LOGE "伪装域名输入错误，请重新输入！${plain}"
+      else
+        break
+      fi
+    done
+    LOGI "伪装域名(host)：$domain"
+
+    echo ""
+    domain=${domain,,}
+    resolve=`curl -sL https://lefu.men/hostip.php?d=${domain}`
+    res=`echo -n ${resolve} | grep ${ip}`
+    if [[ -z "${res}" ]]; then
+      echo " ${domain} 解析结果：${resolve}"
+      LOGE "伪装域名未解析到当前服务器IP(${ip})!${plain}"
+      exit 1
+    fi
+  fi
+
   echo ""
-  read -p " 请输入端口[100-65535的一个数字，默认443]：" port
+  read -p " 请输入nginx端口[100-65535的一个数字，默认443]：" port
   [[ -z "${port}" ]] && port=443
   if [[ "${port:0:1}" = "0" ]]; then
     LOGE "端口不能以0开头${plain}"
@@ -742,10 +736,45 @@ config_sing-box(){
 	fi
   LOGI " UUID：$uuid"
 
+  echo ""
+  read -p " 请输入Shadowsocks端口[30000-65535的一个数字，默认34210]：" port_ss
+  [[ -z "${port_ss}" ]] && port=34210
+  if [[ "${port_ss:0:1}" = "0" ]]; then
+    LOGE "端口不能以0开头"
+    exit 1
+  fi
+  LOGI " Shadowsocks端口：$port_ss"
+
+  echo ""
+  echo "数据加密方式："
+  echo -e " ${red}1. 2022-blake3-aes-128-gcm${plain}"
+  echo -e " ${red}2. chacha20-ietf-poly1305${plain}"      
+  echo ""
+  read -p "请加密类型，默认为1：" method_type
+  [[ -z "${method_type}" ]] && method_type=1
+
+  case $method_type in
+  1)
+    method="2022-blake3-aes-128-gcm"
+    password=`openssl rand -base64 16`
+    ;;
+  2)
+    method="chacha20-ietf-poly1305"
+    password=`cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 16 | head -n 1`
+    ;;
+  *)
+    LOGE " 请输入正确的选项！"
+    exit 1
+  esac
+
+  LOGI "加密类型：$method"
+  LOGI "密码：$password"
+
   if [[ "${tlsFlag}" == "y" ]]; then
     create_Cert
   fi
 
+  install_Nginx
   config_Nginx
 
   LOGD "开始配置config.json..."
@@ -779,6 +808,19 @@ config_sing-box(){
     "disable_expire": false
   },
   "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-in",
+      "listen": "0.0.0.0",
+      "listen_port": ${port_ss},
+      "method": "${method}",
+      "password": "${password}",
+      "network": "tcp",
+      "domain_strategy": "prefer_ipv4",
+      "tcp_fast_open": true,
+      "sniff": true,
+      "proxy_protocol": false
+    },
     {
       "type": "vmess",
       "tag": "vmess-in",
@@ -879,6 +921,7 @@ setFirewall() {
     if [[ $? -eq 0 ]];then
       firewall-cmd --permanent --add-service=http
       firewall-cmd --permanent --add-service=https
+      firewall-cmd --permanent --add-port=${port_ss}/tcp
       if [[ "$port" != "443" ]]; then
         firewall-cmd --permanent --add-port=${port}/tcp
       fi
@@ -888,6 +931,7 @@ setFirewall() {
       if [[ "$nl" != "3" ]]; then
         iptables -I INPUT -p tcp --dport 80 -j ACCEPT
         iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+        iptables -I INPUT -p tcp --dport ${port_ss} -j ACCEPT
         if [[ "$port" != "443" ]]; then
           iptables -I INPUT -p tcp --dport ${port} -j ACCEPT
         fi
@@ -900,6 +944,7 @@ setFirewall() {
       if [[ "$nl" != "3" ]]; then
         iptables -I INPUT -p tcp --dport 80 -j ACCEPT
         iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+        iptables -I INPUT -p tcp --dport ${port_ss} -j ACCEPT
         if [[ "$port" != "443" ]]; then
           iptables -I INPUT -p tcp --dport ${port} -j ACCEPT
         fi
@@ -911,6 +956,7 @@ setFirewall() {
         if [[ "$res" = "" ]]; then
           ufw allow http/tcp
           ufw allow https/tcp
+          ufw allow ${port_ss}/tcp
           if [[ "$port" != "443" ]]; then
             ufw allow ${port}/tcp
           fi
