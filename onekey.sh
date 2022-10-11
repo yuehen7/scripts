@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_ONEKEY_VERSION='1.0.1'
+SING_BOX_ONEKEY_VERSION='1.0.2'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -273,7 +273,7 @@ clear_sing_box() {
   LOGD "清除sing-box完毕"
 }
 
-uninstall_sing-box() {
+uninstall_Nginx() {
   echo ""
   LOGI "开始卸载nginx..."
   systemctl stop nginx
@@ -289,13 +289,16 @@ uninstall_sing-box() {
   if [[ -f /etc/nginx/nginx.conf.bak ]]; then
     mv /etc/nginx/nginx.conf.bak /etc/nginx/nginx.conf
   fi
-    
-  rm -rf $NGINX_CONF_PATH${domain}.conf
-  rm -rf /usr/share/nginx
+
   ~/.acme.sh/acme.sh --uninstall
-  rm -rf ~/.acme.sh
+  rm -rf $NGINX_CONF_PATHalone.conf && rm -rf /usr/share/nginx && rm -rf ~/.acme.sh
+
   LOGI "nginx及acme.sh卸载完成."
-  
+}
+
+uninstall_sing-box() {
+  uninstall_Nginx
+  echo ""
   LOGD "开始卸载sing-box..."
   pidOfsing_box=$(pidof sing-box)
   if [ -n ${pidOfsing_box} ]; then
@@ -364,6 +367,8 @@ stop_sing-box() {
 }
 
 install_sing-box() {
+  install_Nginx
+
   LOGD "开始安装sing-box..."
   if [[ $# -ne 0 ]]; then
     download_sing-box $1
@@ -447,7 +452,7 @@ enable_sing-box() {
   fi
 }
 
-getCert() {
+create_Cert() {
   LOGD "开始获取证书..."
   systemctl stop nginx
   sleep 2s
@@ -493,15 +498,41 @@ getCert() {
   }
 }
 
+install_Nginx() {
+  LOGI " 开始安装nginx..."
+  if [[ ${OS_RELEASE} == "ubuntu" || ${OS_RELEASE} == "debian" ]]; then
+    apt install nginx -y
+    if [[ "$?" != "0" ]]; then
+      LOGE " Nginx安装失败！"
+      exit 1
+    fi
+  elif [[ ${OS_RELEASE} == "centos" ]]; then
+    yum install epel-release -y
+    if [[ "$?" != "0" ]]; then
+      echo '[nginx-stable]
+name=nginx stable repo
+baseurl=http://nginx.org/packages/centos/$releasever/$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=https://nginx.org/keys/nginx_signing.key
+module_hotfixes=true' > /etc/yum.repos.d/nginx.repo
+    fi
+    yum install nginx -y
+    if [[ "$?" != "0" ]]; then
+      LOGE " Nginx安装失败！"
+      exit 1
+    fi
+  fi
+  systemctl enable nginx
+}
+
 config_Nginx() {
-  echo ""
   LOGD "开始配置nginx..."
-  
   systemctl stop nginx
 
+  LOGD "配置伪装站..."
   rm -rf /usr/share/nginx/html
   mkdir -p /usr/share/nginx/html
-  LOGD "配置伪装站..."
   wget -c -P /usr/share/nginx "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html8.zip" >/dev/null
   unzip -o "/usr/share/nginx/html8.zip" -d /usr/share/nginx/html >/dev/null
   rm -f "/usr/share/nginx/html8.zip*"
@@ -552,12 +583,14 @@ http {
 EOF
 
   mkdir -p $NGINX_CONF_PATH
-  cat > /etc/nginx/conf.d/alone.conf<<-EOF
+
+  if [[ "${tlsFlag}" = "y" ]]; then
+    cat > $NGINX_CONF_PATHalone.conf<<-EOF
 server {
   listen 80;
   listen [::]:80;
   server_name ${domain};
-  rewrite ^(.*)$ https://${domain}$1 permanent;
+  rewrite ^(.*)$ https://${domain}:${port}$1 permanent;
 }
 
 server {
@@ -598,6 +631,40 @@ server {
   }
 }
 EOF
+  else
+    cat > $NGINX_CONF_PATHalone.conf<<-EOF
+server {
+  listen ${port};
+  server_name ${domain};
+  
+  root /usr/share/nginx/html;
+
+  location /vmess {
+    proxy_redirect off;
+    proxy_pass http://127.0.0.1:33210;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$http_host;
+    proxy_read_timeout 300s;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  }
+
+  location /trojan {
+    proxy_redirect off;
+    proxy_pass http://127.0.0.1:33211;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host \$http_host;
+    proxy_read_timeout 300s;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+  }
+}    
+EOF
+  fi
   LOGD "nginx配置完成..."
   systemctl restart nginx
 }
@@ -650,6 +717,11 @@ config_sing-box(){
   fi
 
   echo ""
+  read -p " 是否开启TLS(y/n)[默认为:y]：" tlsFlag
+  [[ -z "${tlsFlag}" ]] && tlsFlag="y"
+  LOGI " 开启tls：$tlsFlag"
+
+  echo ""
   read -p " 请输入端口[100-65535的一个数字，默认443]：" port
   [[ -z "${port}" ]] && port=443
   if [[ "${port:0:1}" = "0" ]]; then
@@ -670,34 +742,10 @@ config_sing-box(){
 	fi
   LOGI " UUID：$uuid"
 
-  echo ""
-  LOGI " 开始安装nginx..."
-  if [[ ${OS_RELEASE} == "ubuntu" || ${OS_RELEASE} == "debian" ]]; then
-    apt install nginx -y
-    if [[ "$?" != "0" ]]; then
-      LOGE " Nginx安装失败！"
-      exit 1
-    fi
-  elif [[ ${OS_RELEASE} == "centos" ]]; then
-    yum install epel-release -y
-    if [[ "$?" != "0" ]]; then
-      echo '[nginx-stable]
-name=nginx stable repo
-baseurl=http://nginx.org/packages/centos/$releasever/$basearch/
-gpgcheck=1
-enabled=1
-gpgkey=https://nginx.org/keys/nginx_signing.key
-module_hotfixes=true' > /etc/yum.repos.d/nginx.repo
-    fi
-    yum install nginx -y
-    if [[ "$?" != "0" ]]; then
-      LOGE " Nginx安装失败！"
-      exit 1
-    fi
+  if [[ "${tlsFlag}" = "y" ]]; then
+    create_Cert
   fi
-  systemctl enable nginx
 
-  getCert
   config_Nginx
 
   LOGD "开始配置config.json..."
