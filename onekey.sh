@@ -882,7 +882,7 @@ config_sing-box(){
         "outbound": "dns-out"
       },
       {
-        "inbound": ["vmess-in","trojan-in"],
+        "inbound": ["ss-in","vmess-in","trojan-in"],
         "network": "tcp",
         "outbound": "direct"
       },
