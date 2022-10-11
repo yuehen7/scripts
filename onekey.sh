@@ -279,10 +279,10 @@ uninstall_sing-box() {
   systemctl stop nginx
   systemctl disable nginx
   if [[ ${OS_RELEASE} == "ubuntu" || ${OS_RELEASE} == "debian" ]]; then
-    apt remove nginx
-    apt remove nginx-common
+    apt remove nginx -y
+    apt remove nginx-common -y
   elif [[ ${OS_RELEASE} == "centos" ]]; then
-    yum remove nginx
+    yum remove nginx -y
   fi
 
   rm -rf /etc/nginx/nginx.conf
@@ -561,7 +561,7 @@ server {
 }
 
 server {
-  listen 443 ssl;
+  listen ${port} ssl;
   server_name ${domain};
 
   ssl_certificate ${CERT_FILE};
