@@ -584,7 +584,7 @@ EOF
 
   mkdir -p $NGINX_CONF_PATH
 
-  if [[ "${tlsFlag}" = "y" ]]; then
+  if [[ "${tlsFlag}" == "y" ]]; then
     cat > $NGINX_CONF_PATHalone.conf<<-EOF
 server {
   listen 80;
@@ -636,7 +636,7 @@ EOF
 server {
   listen ${port};
   server_name ${domain};
-  
+
   root /usr/share/nginx/html;
 
   location /vmess {
@@ -742,7 +742,7 @@ config_sing-box(){
 	fi
   LOGI " UUID：$uuid"
 
-  if [[ "${tlsFlag}" = "y" ]]; then
+  if [[ "${tlsFlag}" == "y" ]]; then
     create_Cert
   fi
 
