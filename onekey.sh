@@ -1059,7 +1059,7 @@ show_menu() {
     showInfo
     ;;     
   *)
-    LOGE "请输入正确的选项 [0-7]"
+    LOGE "请输入正确的选项 [0-8]"
     ;;
   esac
 }
