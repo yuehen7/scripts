@@ -271,7 +271,7 @@ update_sing-box() {
     LOGE "system did not install sing-box,please install it firstly"
     show_menu
   fi
-  download_sing-box && install_sing-box
+  download_sing-box
   if ! systemctl restart sing-box; then
     LOGE "update sing-box failed,please check logs"
     show_menu
