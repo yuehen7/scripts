@@ -23,6 +23,7 @@ sing-box安装后可直接使用sing-box命令
 该脚本使用nginx前置进行vmess和trojan分流，自动创建静态网站进行伪装.
 * vmess+ws+tls
 * trojan+ws+tls
+* shadowsocks
 
 ```
 bash <(curl -s -L https://raw.githubusercontent.com/yuehen7/scripts/main/onekey.sh)
