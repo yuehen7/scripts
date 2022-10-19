@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_ONEKEY_VERSION='1.0.11'
+SING_BOX_ONEKEY_VERSION='1.0.12'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -285,6 +285,19 @@ update_sing-box() {
   mkdir -p ${DOWNLAOD_PATH}  
 
   wget -N --no-check-certificate -O ${DOWNLAOD_PATH}/sing-box-${SING_BOX_VERSION}-linux-${OS_ARCH}.tar.gz ${DOWANLOAD_URL}
+
+  cd ${DOWNLAOD_PATH}
+  tar -xvf sing-box-${SING_BOX_VERSION}-linux-${OS_ARCH}.tar.gz && cd sing-box-${SING_BOX_VERSION}-linux-${OS_ARCH}
+
+  if [[ $? -ne 0 ]]; then
+    clear_sing_box
+    OGE "解压sing-box安装包失败,脚本退出"
+    exit 1
+  else
+    LOGI "解压sing-box安装包成功"
+  fi
+
+  install -m 755 sing-box ${BINARY_FILE_PATH}
 
   if ! systemctl restart sing-box; then
     LOGE "update sing-box failed,please check logs"
