@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_ONEKEY_VERSION='1.0.10'
+SING_BOX_ONEKEY_VERSION='1.0.11'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -273,6 +273,7 @@ update_sing-box() {
   fi
 
   systemctl stop sing-box
+  os_check && arch_check
 
   local SING_BOX_VERSION_TEMP=$(curl -Ls "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
   SING_BOX_VERSION=${SING_BOX_VERSION_TEMP:1}
