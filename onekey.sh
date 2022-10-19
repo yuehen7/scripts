@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_ONEKEY_VERSION='1.0.7'
+SING_BOX_ONEKEY_VERSION='1.0.8'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -262,6 +262,21 @@ download_sing-box() {
     exit 1
   else
     LOGI "下载sing-box成功"
+  fi
+}
+
+update_sing-box() {
+  LOGD "开始更新sing-box..."
+  if [[ ! -f "${SERVICE_FILE_PATH}" ]]; then
+    LOGE "system did not install sing-box,please install it firstly"
+    show_menu
+  fi
+  download_sing-box && install_sing-box
+  if ! systemctl restart sing-box; then
+    LOGE "update sing-box failed,please check logs"
+    show_menu
+  else
+    LOGI "update sing-box success"
   fi
 }
 
@@ -1003,12 +1018,14 @@ show_menu() {
   ${green}sing-box-ongkey:v${SING_BOX_ONEKEY_VERSION} 管理脚本${plain}
   ${green}0.${plain} 退出脚本
   ${green}1.${plain} 安装 sing-box 服务
-  ${green}2.${plain} 卸载 sing-box 服务
-  ${green}3.${plain} 启动 sing-box 服务
-  ${green}4.${plain} 停止 sing-box 服务
-  ${green}5.${plain} 重启 sing-box 服务
-  ${green}6.${plain} 检查 sing-box 配置
-  ${green}7.${plain} 查看 sing-box 配置
+  ${green}2.${plain} 更新 sing-box 服务
+  ${green}3.${plain} 卸载 sing-box 服务
+  ${green}4.${plain} 启动 sing-box 服务
+  ${green}5.${plain} 停止 sing-box 服务
+  ${green}6.${plain} 重启 sing-box 服务
+  ${green}7.${plain} 检查 sing-box 配置
+  ${green}8.${plain} 查看 sing-box 配置
+
  "
   show_status
   echo && read -p "请输入选择[0-7]:" num
@@ -1021,21 +1038,24 @@ show_menu() {
     install_sing-box && showInfo
     ;;
   2)
+    update_sing-box && showInfo
+    ;;  
+  3)
     uninstall_sing-box && show_menu
     ;;
-  3)
+  4)
     start_sing-box && show_menu
     ;;
-  4)
+  5)
     stop_sing-box && show_menu
     ;;
-  5)
+  6)
     restart_sing-box && show_menu
     ;;
-  6)
+  7)
     config_check && show_menu
     ;;    
-  7)
+  8)
     showInfo
     ;;     
   *)
