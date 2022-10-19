@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_ONEKEY_VERSION='1.0.9'
+SING_BOX_ONEKEY_VERSION='1.0.10'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -271,7 +271,20 @@ update_sing-box() {
     LOGE "system did not install sing-box,please install it firstly"
     show_menu
   fi
-  download_sing-box
+
+  systemctl stop sing-box
+
+  local SING_BOX_VERSION_TEMP=$(curl -Ls "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+  SING_BOX_VERSION=${SING_BOX_VERSION_TEMP:1}
+
+  LOGI "将选择使用版本:${SING_BOX_VERSION}"
+  local DOWANLOAD_URL="https://github.com/SagerNet/sing-box/releases/download/${SING_BOX_VERSION_TEMP}/sing-box-${SING_BOX_VERSION}-linux-${OS_ARCH}.tar.gz"
+
+  rm -rf ${DOWNLAOD_PATH}  
+  mkdir -p ${DOWNLAOD_PATH}  
+
+  wget -N --no-check-certificate -O ${DOWNLAOD_PATH}/sing-box-${SING_BOX_VERSION}-linux-${OS_ARCH}.tar.gz ${DOWANLOAD_URL}
+
   if ! systemctl restart sing-box; then
     LOGE "update sing-box failed,please check logs"
     show_menu
@@ -422,7 +435,6 @@ install_systemd_service() {
   if [ -f "${SERVICE_FILE_PATH}" ]; then
     rm -rf ${SERVICE_FILE_PATH}
   fi
-  #create service file
   touch ${SERVICE_FILE_PATH}
   if [ $? -ne 0 ]; then
     LOGE "create service file failed,exit"
@@ -899,7 +911,9 @@ config_sing-box(){
       {
         "inbound": ["ss-in","vmess-in","trojan-in"],
         "network": "tcp",
-        "outbound": "direct"
+        "geosite": ["cn", "category-ads-all"],
+        "geoip": ["cn"],
+        "outbound": "block"
       },
       {
         "geosite": "category-ads-all",
