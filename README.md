@@ -29,6 +29,16 @@ sing-box安装后可直接使用sing-box命令
 bash <(curl -s -L https://raw.githubusercontent.com/yuehen7/scripts/main/onekey.sh)
 ```
 
+0. 退出脚本
+1. 安装 sing-box 服务
+2. 更新 sing-box 服务
+3. 卸载 sing-box 服务
+4. 启动 sing-box 服务
+5. 停止 sing-box 服务
+6. 重启 sing-box 服务
+7. 检查 sing-box 配置
+8. 查看 sing-box 配置
+
 
 
 
