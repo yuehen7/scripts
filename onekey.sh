@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_ONEKEY_VERSION='1.0.12'
+SING_BOX_ONEKEY_VERSION='1.0.13'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -1026,14 +1026,27 @@ showInfo() {
     base64Str=$(echo -n "{\"port\":${port},\"ps\":\"${domain}_vmess\",\"tls\":\"tls\",\"id\":\"${uuid}\",\"aid\":0,\"v\":2,\"host\":\"${domain}\",\"type\":\"none\",\"path\":\"/vmess\",\"net\":\"ws\",\"add\":\"${domain}\",\"allowInsecure\":0,\"peer\":\"${domain}\",\"sni\":\"\"}" | base64 -w 0)
     base64Str="${base64Str// /}"
 
+    ss_ip=`curl -sL -4 ip.sb`
+    line1=`grep -n 'shadowsocks' ${CONFIG_FILE_PATH}/config.json | head -n1 | cut -d: -f1`
+    line11=`expr $line1 + 3`
+    ss_port=`sed -n "${line11}p" ${CONFIG_FILE_PATH}/config.json | cut -d: -f2 | tr -d \",' '`
+    line11=`expr $line1 + 4`
+    ss_method=`sed -n "${line11}p" ${CONFIG_FILE_PATH}/config.json | cut -d: -f2 | tr -d \",' '`
+    line11=`expr $line1 + 5`
+    ss_password=`sed -n "${line11}p" ${CONFIG_FILE_PATH}/config.json | cut -d: -f2 | tr -d \",' '`
+
+    ss_base64Str=$(echo -n "${ss_method}:${ss_password}" | base64 -w 0)
+    ss_base64Str="${ss_base64Str// /}"
+
     echo ""
     echo -e "${blue}vmess+ws+tls：${plain}"
-    echo -e ""
     echo -e "vmess://${base64Str}\n"
     echo -e ""
     echo -e "${blue}trojan+ws+tls：${plain}"
-    echo -e ""
     echo -e "trojan://${uuid}@${domain}:${port}?security=tls&type=ws&host=${domain}&path=%2Ftrojan#${domain}_trojan\n"
+    echo -e ""
+    echo -e "${blue}Shadowsocks：${plain}"
+    echo -e "ss://${ss_base64Str}@${ss_ip}:${ss_port}#ss\n"
     echo ""
   else
     LOGE "没有读取配置文件失败."
