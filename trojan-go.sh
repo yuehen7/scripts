@@ -28,10 +28,10 @@ fi
 # 以下网站是随机从Google上找到的无广告小说网站，不喜欢请改成其他网址，以http或https开头
 # 搭建好后无法打开伪装域名，可能是反代小说网站挂了，请在网站留言，或者Github发issue，以便替换新的网站
 SITES=(
-http://www.ddxsku.com/
+https://m.23xstxt.net/
 http://www.biqu6.com/
 http://www.bequgexs.com/
-http://www.tjwl.com/
+http://www.523us.com/
 )
 
 ZIP_FILE="trojan-go"
@@ -260,9 +260,9 @@ getData() {
     echo "   1) 静态网站(位于/usr/share/nginx/html)"
     echo "   2) 小说站(随机选择)"
     echo "   3) 自定义反代站点(需以http或者https开头)"
-    read -p "  请选择伪装网站类型[默认:高清壁纸站]" answer
+    read -p "  请选择伪装网站类型[默认:bing.com]" answer
     if [[ -z "$answer" ]]; then
-        PROXY_URL="https://bing.imeizi.me"
+        PROXY_URL="https://bing.com"
     else
         case $answer in
         1)
