@@ -16,6 +16,10 @@
 wget -N --no-check-certificate https://raw.githubusercontent.com/yuehen7/scripts/main/main.sh && chmod +x main.sh && bash main.sh
 ```
 
+```
+bash <(curl -s -L https://raw.githubusercontent.com/yuehen7/scripts/main/main.sh)
+```
+
 sing-box安装后可直接使用sing-box命令
 
 ### sing-box一键脚本使用
