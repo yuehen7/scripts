@@ -19,7 +19,7 @@ OS_ARCH=''
 SING_BOX_VERSION=''
 
 #script version
-SING_BOX_YES_VERSION='1.0.11'
+SING_BOX_YES_VERSION='1.0.12'
 
 #package download path
 DOWNLAOD_PATH='/usr/local/sing-box'
@@ -352,10 +352,9 @@ uninstall_sing-box() {
     systemctl stop nginx
     systemctl disable nginx
     if [[ ${OS_RELEASE} == "ubuntu" || ${OS_RELEASE} == "debian" ]]; then
-      apt remove nginx -y
-      apt remove nginx-common -y
+      apt autoremove nginx -y
     elif [[ ${OS_RELEASE} == "centos" ]]; then
-      yum remove nginx -y
+      yum autoremove nginx -y
     fi
 
     rm -rf /etc/nginx/nginx.conf
@@ -835,10 +834,8 @@ EOF
 }
 
 SITES=(
-http://www.ddxsku.com/
 http://www.biqu6.com/
 http://www.55shuba.com/
-https://www.23xsw.cc/
 http://www.bequgexs.com/
 http://www.tjwl.com/
 )
@@ -922,10 +919,9 @@ config_Trojan(){
   echo "  1) 静态网站(位于/usr/share/nginx/html)"
   echo "  2) 小说站(随机选择)"
   echo "  3) Bing(http://www.bing.com)"  
-  echo "  4) 自定义反代站点(需以http或者https开头)"
   read -p " 请选择伪装网站类型[默认:Bing]" answer
   if [[ -z "$answer" ]]; then
-    proxy_url="https://www.baidu.com"
+    proxy_url="https://www.bing.com"
   else
     case $answer in
     1)
@@ -949,16 +945,6 @@ config_Trojan(){
       ;;  
     3)
       proxy_url="https://www.bing.com"
-      ;;
-    4)
-      read -p " 请输入反代站点(以http或者https开头)：" proxy_url
-      if [[ -z "$proxy_url" ]]; then
-        LOGE " 请输入反代网站！"
-        exit 1
-      elif [[ "${proxy_url:0:4}" != "http" ]]; then
-        LOGE " 反代网站必须以http或https开头！"
-        exit 1
-      fi
       ;;
     *)
       LOGE " 请输入正确的选项！"
@@ -1217,10 +1203,13 @@ http {
     include /etc/nginx/conf.d/*.conf;
 }
 EOF
-    
     mkdir -p $NGINX_CONF_PATH
     if [[ "$proxy_url" = "" ]]; then
-        cat > $NGINX_CONF_PATH${domain}.conf<<-EOF
+      wget -c -P /usr/share/nginx "https://raw.githubusercontent.com/mack-a/v2ray-agent/master/fodder/blog/unable/html8.zip" >/dev/null
+      unzip -o "/usr/share/nginx/html8.zip" -d /usr/share/nginx/html >/dev/null
+      rm -f "/usr/share/nginx/html8.zip*"
+
+      cat > $NGINX_CONF_PATH${domain}.conf<<-EOF
 server {
     listen 80;
     listen [::]:80;
