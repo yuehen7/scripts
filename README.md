@@ -33,6 +33,18 @@ sing-box安装后可直接使用sing-box命令
 bash <(curl -s -L https://raw.githubusercontent.com/yuehen7/scripts/main/onekey.sh)
 ```
 
+### sing-box一键CF脚本
+
+该脚本不需要域名，可使用CF优选IP地址
+* vmess
+* trojan
+
+```
+bash <(curl -s -L https://raw.githubusercontent.com/yuehen7/scripts/main/onekey-singbox.sh)
+```
+
+
+
 0. 退出脚本
 1. 安装 sing-box 服务
 2. 更新 sing-box 服务
