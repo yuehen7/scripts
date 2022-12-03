@@ -35,7 +35,7 @@ bash <(curl -s -L https://raw.githubusercontent.com/yuehen7/scripts/main/onekey.
 
 ### sing-box一键CF脚本
 
-该脚本不需要域名，可使用CF优选IP地址
+该脚本不需要域名，使用CF优选IP地址
 * vmess
 * trojan
 
