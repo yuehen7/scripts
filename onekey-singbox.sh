@@ -299,12 +299,12 @@ cat>sing-box/config.json<<EOF
       }
     ],
     "geoip": {
-      "path": "./geoip.db",
+      "path": "geoip.db",
       "download_url": "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db",
       "download_detour": "direct"
     },
     "geosite": {
-      "path": "./geosite.db",
+      "path": "geosite.db",
       "download_url": "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db",
       "download_detour": "direct"
     },
