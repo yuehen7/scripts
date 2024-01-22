@@ -406,6 +406,17 @@ stop_sing-box() {
 
 install_sing-box() {
   LOGD "开始安装sing-box..."
+  
+  # Check if Nginx is installed
+  if ! nginx -v &>/dev/null; then
+    LOGI "Nginx未安装, 正在安装Nginx..."
+    install_Nginx
+    config_Nginx
+    LOGI "Nginx安装和配置完成."
+  else
+    LOGI "Nginx已安装, 跳过安装步骤."
+  fi
+
   if [[ $# -ne 0 ]]; then
     download_sing-box $1
   else
@@ -417,7 +428,7 @@ install_sing-box() {
 
   if [[ ! -f "${DOWNLAOD_PATH}/sing-box-${SING_BOX_VERSION}-linux-${OS_ARCH}.tar.gz" ]]; then
     clear_sing_box
-    LOGE "could not find sing-box packages,plz check dowanload sing-box whether suceess"
+    LOGE "未找到sing-box包，请检查是否下载成功"
     exit 1
   fi
   cd ${DOWNLAOD_PATH}
@@ -426,7 +437,7 @@ install_sing-box() {
 
   if [[ $? -ne 0 ]]; then
     clear_sing_box
-    OGE "解压sing-box安装包失败,脚本退出"
+    LOGE "解压sing-box安装包失败, 脚本退出"
     exit 1
   else
     LOGI "解压sing-box安装包成功"
@@ -435,14 +446,15 @@ install_sing-box() {
   install -m 755 sing-box ${BINARY_FILE_PATH}
 
   if [[ $? -ne 0 ]]; then
-    LOGE "install sing-box failed,exit"
+    LOGE "安装sing-box失败, 退出"
     exit 1
   else
-    LOGI "install sing-box suceess"
+    LOGI "安装sing-box成功"
   fi
   install_systemd_service && enable_sing-box && start_sing-box
-  LOGI "安装sing-box成功,已启动成功"
+  LOGI "安装sing-box成功, 已启动服务"
 }
+
 
 install_systemd_service() {
   LOGD "开始安装sing-box systemd服务..."
