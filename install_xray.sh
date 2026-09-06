@@ -200,6 +200,47 @@ check_port_available() {
     fi
 }
 
+# 使用本机到候选站点的 TLS 建连耗时选择 REALITY 伪装目标。
+select_reality_target() {
+    local -a candidates=(
+        "www.icloud.com"
+        "xp.apple.com" "vs.aws.amazon.com" "www.xbox.com"
+        "www.oracle.com" "images.nvidia.com" "www.amazon.com" "aws.amazon.com"
+        "www.amd.com" "www.sony.com" "www.tesla.com" "www.intel.com"
+        "www.nvidia.com" "www.apple.com"
+    )
+    local domain elapsed best_domain="" best_elapsed="" milliseconds
+
+    echo -e "${YELLOW}正在检测 REALITY 伪装目标的 TLS 1.3 建连延迟...${PLAIN}" >&2
+    for domain in "${candidates[@]}"; do
+        if elapsed=$(curl -4 --noproxy '*' --tlsv1.3 -s -o /dev/null \
+            --connect-timeout 1.5 --max-time 1.5 -w '%{time_appconnect}' "https://${domain}"); then
+            if [[ "$elapsed" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v value="$elapsed" 'BEGIN { exit !(value > 0) }'; then
+                milliseconds=$(awk -v value="$elapsed" 'BEGIN { printf "%.0f", value * 1000 }')
+                echo -e "  ${GREEN}${domain}: ${milliseconds} ms${PLAIN}" >&2
+                if [[ -z "$best_elapsed" ]] || awk -v value="$elapsed" -v best="$best_elapsed" 'BEGIN { exit !(value < best) }'; then
+                    best_domain="$domain"
+                    best_elapsed="$elapsed"
+                fi
+                continue
+            fi
+        fi
+        echo -e "  ${RED}${domain}: timeout${PLAIN}" >&2
+    done
+
+    if [[ -z "$best_domain" ]]; then
+        echo -e "${RED}所有 REALITY 候选目标均无法完成 TLS 1.3 握手。${PLAIN}" >&2
+        return 1
+    fi
+
+    milliseconds=$(awk -v value="$best_elapsed" 'BEGIN { printf "%.0f", value * 1000 }')
+    echo -e "${GREEN}已选择 REALITY 目标: ${best_domain}:443 (${milliseconds} ms)${PLAIN}" >&2
+    if [[ "$best_domain" == *apple.com || "$best_domain" == "www.icloud.com" ]]; then
+        echo -e "${YELLOW}提示: Xray 会警告 Apple/iCloud 目标可能带来 IP 封锁风险。${PLAIN}" >&2
+    fi
+    printf '%s\n' "$best_domain"
+}
+
 # 查看节点配置与分享链接
 view_inbound_info() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -210,9 +251,10 @@ view_inbound_info() {
     local server_ip
     server_ip=$(curl -s4m 6 https://api.ipify.org || curl -s4m 6 https://ip.sb || echo "YOUR_SERVER_IP")
 
-    local r_tag ws_tag
+    local r_tag ws_tag xhttp_tag
     r_tag=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
     ws_tag=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+    xhttp_tag=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
 
     echo -e "\n${CYAN}================================================================${PLAIN}"
     echo -e "${CYAN}                     当前 Xray 入站节点配置详情                 ${PLAIN}"
@@ -338,6 +380,62 @@ view_inbound_info() {
         echo -e "----------------------------------------------------------------"
     fi
 
+    if [[ -n "$xhttp_tag" ]]; then
+        local xhttp_port xhttp_uuid xhttp_sni xhttp_path xhttp_alpn xhttp_mode xhttp_path_uri
+        xhttp_port=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .port' "$CONFIG_FILE")
+        xhttp_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .settings.clients[0].id' "$CONFIG_FILE")
+        xhttp_sni=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
+        xhttp_path=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .streamSettings.xhttpSettings.path' "$CONFIG_FILE")
+        xhttp_alpn=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | (.streamSettings.tlsSettings.alpn[0] // "h2")' "$CONFIG_FILE")
+        xhttp_mode=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | (.streamSettings.xhttpSettings.mode // "packet-up")' "$CONFIG_FILE")
+        xhttp_path_uri=${xhttp_path//\//%2F}
+
+        echo -e "${GREEN}【协议 3: VLESS + XHTTP + TLS (CDN 备用)】${PLAIN}"
+        echo -e "  地址 (Address):     ${CYAN}${xhttp_sni} (或填服务器IP/CDN优选IP)${PLAIN}"
+        echo -e "  端口 (Port):        ${CYAN}${xhttp_port}${PLAIN}"
+        echo -e "  用户 ID (UUID):     ${CYAN}${xhttp_uuid}${PLAIN}"
+        echo -e "  传输协议 (Network): xhttp"
+        echo -e "  传输模式 (Mode):    ${CYAN}${xhttp_mode}${PLAIN}"
+        echo -e "  传输安全 (Security):tls"
+        echo -e "  伪装域名 (SNI/Host):${CYAN}${xhttp_sni}${PLAIN}"
+        echo -e "  路径 (Path):        ${CYAN}${xhttp_path}${PLAIN}"
+
+        local xhttp_link="vless://${xhttp_uuid}@${xhttp_sni}:${xhttp_port}?encryption=none&security=tls&sni=${xhttp_sni}&fp=chrome&alpn=${xhttp_alpn}&insecure=0&allowInsecure=0&type=xhttp&host=${xhttp_sni}&path=${xhttp_path_uri}&mode=${xhttp_mode}#Xray-XHTTP-TLS"
+        echo -e "  分享链接 (Link):"
+        echo -e "  ${YELLOW}${xhttp_link}${PLAIN}"
+        echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
+        jq -n \
+            --arg name "Xray-XHTTP-TLS" \
+            --arg server "$xhttp_sni" \
+            --argjson port "$xhttp_port" \
+            --arg uuid "$xhttp_uuid" \
+            --arg sni "$xhttp_sni" \
+            --arg alpn "$xhttp_alpn" \
+            --arg path "$xhttp_path" \
+            --arg mode "$xhttp_mode" \
+            '{
+              name: $name,
+              type: "vless",
+              server: $server,
+              port: $port,
+              udp: true,
+              uuid: $uuid,
+              encryption: "",
+              tls: true,
+              servername: $sni,
+              alpn: [$alpn],
+              "client-fingerprint": "chrome",
+              "skip-cert-verify": false,
+              network: "xhttp",
+              "xhttp-opts": {
+                path: $path,
+                host: $sni,
+                mode: $mode
+              }
+            }'
+        echo -e "----------------------------------------------------------------"
+    fi
+
     echo -e "${CYAN}证书目录: ${CERT_DIR}/${PLAIN}"
     echo -e "  公钥路径: ${YELLOW}${CERT_DIR}/fullchain.pem${PLAIN}"
     echo -e "  私钥路径: ${YELLOW}${CERT_DIR}/privkey.pem${PLAIN}"
@@ -351,7 +449,7 @@ generate_production_config() {
     ensure_dummy_cert || return 1
 
     echo -e "\n${CYAN}=================================================${PLAIN}"
-    echo -e "${CYAN}        Xray 节点配置生成器 (Dual-Inbound)       ${PLAIN}"
+    echo -e "${CYAN}        Xray 节点配置生成器 (Triple-Inbound)     ${PLAIN}"
     echo -e "${CYAN}=================================================${PLAIN}"
 
     local ws_domain=""
@@ -370,6 +468,12 @@ generate_production_config() {
     local uuid
     uuid=$(${INSTALL_DIR}/xray uuid) || {
         echo -e "${RED}无法生成 UUID。${PLAIN}"
+        return 1
+    }
+
+    local reality_domain
+    reality_domain=$(select_reality_target) || {
+        echo -e "${RED}无法选择 REALITY 伪装目标，未写入新配置。请检查服务器的 IPv4 出站网络后重试。${PLAIN}"
         return 1
     }
 
@@ -424,10 +528,10 @@ generate_production_config() {
         "security": "reality",
         "realitySettings": {
           "show": false,
-          "dest": "www.apple.com:443",
+          "dest": "${reality_domain}:443",
           "xver": 0,
           "serverNames": [
-            "www.apple.com"
+            "${reality_domain}"
           ],
           "privateKey": "${private_key}",
           "shortIds": [
@@ -470,6 +574,44 @@ generate_production_config() {
         },
         "wsSettings": {
           "path": "/ray"
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "tag": "vless-xhttp-tls-in",
+      "port": 2053,
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "${uuid}"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "${ws_domain}",
+          "alpn": [
+            "h2"
+          ],
+          "certificates": [
+            {
+              "certificateFile": "${CERT_DIR}/fullchain.pem",
+              "keyFile": "${CERT_DIR}/privkey.pem"
+            }
+          ]
+        },
+        "xhttpSettings": {
+          "path": "/xhttp",
+          "mode": "packet-up"
         }
       },
       "sniffing": {
@@ -560,7 +702,7 @@ EOF
 show_start_failure() {
     echo -e "${RED}Xray 启动失败。以下是最近的 systemd 日志：${PLAIN}"
     journalctl -u xray --no-pager -n 40 -o cat 2>/dev/null || true
-    echo -e "${YELLOW}可依次执行：xr test、ss -ltnp | grep -E ':(443|8443)'、xr log${PLAIN}"
+    echo -e "${YELLOW}可依次执行：xr test、ss -ltnp | grep -E ':(443|2053|8443)'、xr log${PLAIN}"
 }
 
 start_service() {
@@ -695,7 +837,7 @@ ${GREEN}Xray (${XRAY_VERSION}) 服务管理工具 (xr)${PLAIN}
  6. 查看入站节点配置 (info)
  7. 检查配置文件 (check/test)
  8. 编辑配置文件 (edit)
- 9. 重新生成双协议配置 (gen)
+ 9. 重新生成三协议配置 (gen)
 10. BBR 状态与网络调优 (bbr)
 11. 卸载 Xray (uninstall)
  0. 退出
@@ -746,6 +888,7 @@ main() {
 
                 check_port_available 443 || exit 1
                 check_port_available 8443 || exit 1
+                check_port_available 2053 || exit 1
                 if ! start_service; then
                     echo -e "${RED}安装完成，但 Xray 未能启动；请根据上方日志修复后执行 xr start。${PLAIN}"
                     exit 1
