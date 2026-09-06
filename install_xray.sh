@@ -20,6 +20,8 @@ CLI_TARGET="/usr/local/bin/xr"
 SYSCTL_BBR_FILE="/etc/sysctl.d/99-network-bbr.conf"
 LIMITS_FILE="/etc/security/limits.d/99-nofile.conf"
 
+set -o pipefail
+
 # 检查 root 权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请以 root 权限运行此脚本！${PLAIN}" && exit 1
 
@@ -121,7 +123,11 @@ download_xray() {
         exit 1
     fi
 
-    unzip -q -o "${tmp_dir}/${filename}" -d "$tmp_dir"
+    if ! unzip -q -o "${tmp_dir}/${filename}" -d "$tmp_dir" || [[ ! -f "${tmp_dir}/xray" ]]; then
+        echo -e "${RED}Xray 安装包无效或不包含 xray 可执行文件。${PLAIN}"
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
     mkdir -p "$CONFIG_DIR"
     mv "${tmp_dir}/xray" "${INSTALL_DIR}/xray"
     chmod +x "${INSTALL_DIR}/xray"
@@ -136,12 +142,61 @@ download_xray() {
 # 证书占位处理
 ensure_dummy_cert() {
     mkdir -p "$CERT_DIR"
-    if [[ ! -f "${CERT_DIR}/fullchain.pem" || ! -f "${CERT_DIR}/privkey.pem" ]]; then
+    if [[ -f "${CERT_DIR}/fullchain.pem" || -f "${CERT_DIR}/privkey.pem" ]]; then
+        if [[ ! -f "${CERT_DIR}/fullchain.pem" || ! -f "${CERT_DIR}/privkey.pem" ]]; then
+            echo -e "${RED}证书目录中只存在证书或私钥其中之一，请补齐后再继续：${CERT_DIR}${PLAIN}"
+            return 1
+        fi
+        return 0
+    fi
+
+    if [[ ! -f "${CERT_DIR}/fullchain.pem" && ! -f "${CERT_DIR}/privkey.pem" ]]; then
         echo -e "${YELLOW}生成初始临时自签名证书...${PLAIN}"
         openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
             -keyout "${CERT_DIR}/privkey.pem" \
             -out "${CERT_DIR}/fullchain.pem" \
-            -subj "/CN=temporary.cert" >/dev/null 2>&1 || true
+            -subj "/CN=temporary.cert" >/dev/null 2>&1 || {
+                echo -e "${RED}无法生成临时证书，请确认 openssl 可用。${PLAIN}"
+                return 1
+            }
+    fi
+}
+
+validate_domain() {
+    local domain="$1"
+    [[ ${#domain} -le 253 ]] || return 1
+    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+check_certificate_files() {
+    local cert_file="${CERT_DIR}/fullchain.pem"
+    local key_file="${CERT_DIR}/privkey.pem"
+
+    if [[ ! -s "$cert_file" || ! -s "$key_file" ]]; then
+        echo -e "${RED}找不到证书文件。请将证书链保存为 ${cert_file}，私钥保存为 ${key_file}。${PLAIN}"
+        return 1
+    fi
+
+    if ! openssl x509 -in "$cert_file" -noout >/dev/null 2>&1; then
+        echo -e "${RED}证书文件不是有效的 PEM 证书：${cert_file}${PLAIN}"
+        return 1
+    fi
+    if ! openssl pkey -in "$key_file" -noout >/dev/null 2>&1; then
+        echo -e "${RED}私钥文件不是有效的 PEM 私钥：${key_file}${PLAIN}"
+        return 1
+    fi
+}
+
+check_port_available() {
+    local port="$1"
+    command -v ss >/dev/null 2>&1 || return 0
+
+    local listeners
+    listeners=$(ss -H -ltn 2>/dev/null | awk -v port="$port" '$4 ~ (":" port "$") { print }')
+    if [[ -n "$listeners" ]]; then
+        echo -e "${RED}端口 ${port} 已被其他进程监听，Xray 无法启动：${PLAIN}"
+        echo "$listeners"
+        return 1
     fi
 }
 
@@ -231,7 +286,7 @@ view_inbound_info() {
 generate_production_config() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$CERT_DIR"
-    ensure_dummy_cert
+    ensure_dummy_cert || return 1
 
     echo -e "\n${CYAN}=================================================${PLAIN}"
     echo -e "${CYAN}        Xray 节点配置生成器 (Dual-Inbound)       ${PLAIN}"
@@ -241,15 +296,27 @@ generate_production_config() {
     while [[ -z "$ws_domain" ]]; do
         read -rp "请输入 vless-ws-tls-in 绑定的域名: " ws_domain </dev/tty
         ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
+        ws_domain=${ws_domain%.}
+        ws_domain=${ws_domain,,}
+        if ! validate_domain "$ws_domain"; then
+            echo -e "${RED}域名格式无效，请输入完整的域名，例如 node.example.com。${PLAIN}"
+            ws_domain=""
+        fi
     done
 
     echo -e "${YELLOW}生成密钥参数中...${PLAIN}"
     local uuid
-    uuid=$(${INSTALL_DIR}/xray uuid)
+    uuid=$(${INSTALL_DIR}/xray uuid) || {
+        echo -e "${RED}无法生成 UUID。${PLAIN}"
+        return 1
+    }
 
     # 精确匹配提取 private_key 与 public_key
     local keypair
-    keypair=$(${INSTALL_DIR}/xray x25519)
+    keypair=$(${INSTALL_DIR}/xray x25519) || {
+        echo -e "${RED}无法生成 REALITY 密钥对。${PLAIN}"
+        return 1
+    }
     local private_key
     private_key=$(echo "$keypair" | grep -iE 'Private[[:space:]]*key' | sed -E 's/.*:[[:space:]]*//' | tr -d '[:space:]')
     local public_key
@@ -258,6 +325,11 @@ generate_production_config() {
     # 双重保障：若提取失败，使用 -i 显式推导
     if [[ -z "$public_key" && -n "$private_key" ]]; then
         public_key=$(${INSTALL_DIR}/xray x25519 -i "$private_key" | grep -iE 'Public[[:space:]]*key' | sed -E 's/.*:[[:space:]]*//' | tr -d '[:space:]')
+    fi
+
+    if [[ -z "$private_key" || -z "$public_key" ]]; then
+        echo -e "${RED}无法解析 REALITY 密钥对，Xray 版本可能不兼容。${PLAIN}"
+        return 1
     fi
 
     echo "$public_key" > "${CONFIG_DIR}/reality_pub.key"
@@ -274,7 +346,7 @@ generate_production_config() {
     {
       "tag": "vless-reality-in",
       "port": 443,
-      "listen": "::",
+      "listen": "0.0.0.0",
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -309,7 +381,7 @@ generate_production_config() {
     {
       "tag": "vless-ws-tls-in",
       "port": 8443,
-      "listen": "::",
+      "listen": "0.0.0.0",
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -391,6 +463,8 @@ setup_service() {
 Description=Xray Service
 Documentation=https://github.com/xtls
 After=network.target nss-lookup.target
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 User=root
@@ -398,6 +472,7 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 NoNewPrivileges=true
 Environment="XRAY_LOCATION_ASSET=${CONFIG_DIR}"
+ExecStartPre=${INSTALL_DIR}/xray run -test -config ${CONFIG_FILE}
 ExecStart=${INSTALL_DIR}/xray run -config ${CONFIG_FILE}
 Restart=on-failure
 RestartPreventExitStatus=23
@@ -408,16 +483,30 @@ LimitNOFILE=1000000
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable xray >/dev/null 2>&1
+    systemctl daemon-reload || return 1
+    systemctl enable xray >/dev/null 2>&1 || {
+        echo -e "${RED}无法启用 xray 服务。${PLAIN}"
+        return 1
+    }
     echo -e "${GREEN}Systemd 系统服务已注册并配置为开机自启。${PLAIN}"
 }
 
 # 状态控制
+show_start_failure() {
+    echo -e "${RED}Xray 启动失败。以下是最近的 systemd 日志：${PLAIN}"
+    journalctl -u xray --no-pager -n 40 -o cat 2>/dev/null || true
+    echo -e "${YELLOW}可依次执行：xr test、ss -ltnp | grep -E ':(443|8443)'、xr log${PLAIN}"
+}
+
 start_service() {
-    systemctl start xray
-    echo -e "${GREEN}Xray 服务已启动。${PLAIN}"
-    check_status
+    test_config || return 1
+    if systemctl start xray; then
+        echo -e "${GREEN}Xray 服务已启动。${PLAIN}"
+        check_status
+    else
+        show_start_failure
+        return 1
+    fi
 }
 
 stop_service() {
@@ -426,9 +515,14 @@ stop_service() {
 }
 
 restart_service() {
-    systemctl restart xray
-    echo -e "${GREEN}Xray 服务已重启。${PLAIN}"
-    check_status
+    test_config || return 1
+    if systemctl restart xray; then
+        echo -e "${GREEN}Xray 服务已重启。${PLAIN}"
+        check_status
+    else
+        show_start_failure
+        return 1
+    fi
 }
 
 check_status() {
@@ -445,7 +539,17 @@ view_logs() {
 }
 
 test_config() {
-    XRAY_LOCATION_ASSET="${CONFIG_DIR}" ${INSTALL_DIR}/xray -test -config "$CONFIG_FILE"
+    if [[ ! -x "${INSTALL_DIR}/xray" ]]; then
+        echo -e "${RED}未找到 Xray 可执行文件：${INSTALL_DIR}/xray${PLAIN}"
+        return 1
+    fi
+    [[ -f "$CONFIG_FILE" ]] || {
+        echo -e "${RED}未找到配置文件：${CONFIG_FILE}${PLAIN}"
+        return 1
+    }
+    check_certificate_files || return 1
+    echo -e "${YELLOW}正在检查 Xray 配置...${PLAIN}"
+    XRAY_LOCATION_ASSET="${CONFIG_DIR}" ${INSTALL_DIR}/xray run -test -config "$CONFIG_FILE"
 }
 
 edit_config() {
@@ -453,7 +557,7 @@ edit_config() {
     command -v nano >/dev/null 2>&1 || editor="vi"
     $editor "$CONFIG_FILE"
     echo -e "${YELLOW}正在检查配置文件语法...${PLAIN}"
-    if XRAY_LOCATION_ASSET="${CONFIG_DIR}" ${INSTALL_DIR}/xray -test -config "$CONFIG_FILE"; then
+    if test_config; then
         read -rp "配置正确，是否重启 Xray 使其生效？[y/N]: " reload_choice </dev/tty
         [[ "$reload_choice" =~ ^[Yy]$ ]] && restart_service
     else
@@ -501,8 +605,15 @@ uninstall_all() {
 
 # 部署全局 xr 快捷命令
 install_cli() {
-    curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_xray.sh -o "$CLI_TARGET"
-    chmod +x "$CLI_TARGET"
+    if [[ -f "$0" && -r "$0" ]]; then
+        cp "$0" "$CLI_TARGET"
+    else
+        curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_xray.sh -o "$CLI_TARGET" || {
+            echo -e "${RED}无法安装 xr 快捷命令。${PLAIN}"
+            return 1
+        }
+    fi
+    chmod 0755 "$CLI_TARGET"
     echo -e "${GREEN}快捷管理命令 'xr' 部署完成。${PLAIN}"
 }
 
@@ -568,7 +679,12 @@ main() {
                 setup_service
                 install_cli
 
-                systemctl restart xray >/dev/null 2>&1 || true
+                check_port_available 443 || exit 1
+                check_port_available 8443 || exit 1
+                if ! start_service; then
+                    echo -e "${RED}安装完成，但 Xray 未能启动；请根据上方日志修复后执行 xr start。${PLAIN}"
+                    exit 1
+                fi
 
                 echo -e "\n${GREEN}=================================================${PLAIN}"
                 echo -e " Xray (${XRAY_VERSION}) 安装完成！"
