@@ -27,19 +27,19 @@ LIMITS_FILE="/etc/security/limits.d/99-nofile.conf"
 install_deps() {
     echo -e "${YELLOW}正在检查并安装基础依赖...${PLAIN}"
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y && apt-get install -y curl wget unzip jq systemd
+        apt-get update -y && apt-get install -y curl wget unzip jq openssl systemd
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl wget unzip jq systemd
+        dnf install -y curl wget unzip jq openssl systemd
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl wget unzip jq systemd
+        yum install -y curl wget unzip jq openssl systemd
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm curl wget unzip jq systemd
+        pacman -Sy --noconfirm curl wget unzip jq openssl systemd
     elif command -v zypper >/dev/null 2>&1; then
-        zypper install -y curl wget unzip jq systemd
+        zypper install -y curl wget unzip jq openssl systemd
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache curl wget unzip jq
+        apk add --no-cache curl wget unzip jq openssl
     else
-        echo -e "${YELLOW}未识别的包管理器，请确保已安装 curl, wget, unzip, jq${PLAIN}"
+        echo -e "${YELLOW}未识别的包管理器，请确保已安装 curl, wget, unzip, jq, openssl${PLAIN}"
     fi
 }
 
@@ -143,6 +143,19 @@ download_xray() {
     echo -e "${GREEN}Xray 二进制安装完成: ${INSTALL_DIR}/xray${PLAIN}"
 }
 
+# 确保证书文件存在，不存在则自动生成占位临时自签名证书防启动崩溃
+ensure_dummy_cert() {
+    mkdir -p "$CERT_DIR"
+    if [[ ! -f "${CERT_DIR}/fullchain.pem" || ! -f "${CERT_DIR}/privkey.pem" ]]; then
+        echo -e "${YELLOW}未检测到 SSL 证书，正在生成临时自签名证书以保证服务顺利启动...${PLAIN}"
+        openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+            -keyout "${CERT_DIR}/privkey.pem" \
+            -out "${CERT_DIR}/fullchain.pem" \
+            -subj "/CN=temporary.cert" >/dev/null 2>&1 || true
+        echo -e "${YELLOW}临时证书已就绪。后续请将该域名的真实证书覆盖至此目录。${PLAIN}"
+    fi
+}
+
 # 查看节点参数与客户端链接
 view_inbound_info() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -216,16 +229,17 @@ view_inbound_info() {
         echo -e "----------------------------------------------------------------"
     fi
 
-    echo -e "${RED}证书目录检查:${PLAIN}"
-    echo -e "  公钥证书: ${CERT_DIR}/fullchain.pem $([[ -f "${CERT_DIR}/fullchain.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
-    echo -e "  私钥证书: ${CERT_DIR}/privkey.pem   $([[ -f "${CERT_DIR}/privkey.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
+    echo -e "${CYAN}证书目录: ${CERT_DIR}/${PLAIN}"
+    echo -e "  公钥路径: ${YELLOW}${CERT_DIR}/fullchain.pem${PLAIN}"
+    echo -e "  私钥路径: ${YELLOW}${CERT_DIR}/privkey.pem${PLAIN}"
     echo -e "${CYAN}================================================================${PLAIN}\n"
 }
 
-# 生成 Xray 格式配置文件（Dual-Inbound + Block CN）
+# 生成 Xray 配置文件
 generate_production_config() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$CERT_DIR"
+    ensure_dummy_cert
 
     echo -e "\n${CYAN}=================================================${PLAIN}"
     echo -e "${CYAN}        Xray 节点配置生成器 (Dual-Inbound)       ${PLAIN}"
@@ -290,7 +304,7 @@ generate_production_config() {
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
+        "destOverride": ["http", "tls"]
       }
     },
     {
@@ -323,7 +337,7 @@ generate_production_config() {
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls", "quic"]
+        "destOverride": ["http", "tls"]
       }
     }
   ],
@@ -367,12 +381,6 @@ generate_production_config() {
 EOF
 
     echo -e "${GREEN}配置文件生成并写入成功！${PLAIN}"
-    echo -e "\n-------------------------------------------------"
-    echo -e "${RED}【证书放置提醒】${PLAIN}"
-    echo -e "公钥路径: ${YELLOW}${CERT_DIR}/fullchain.pem${PLAIN}"
-    echo -e "私钥路径: ${YELLOW}${CERT_DIR}/privkey.pem${PLAIN}"
-    echo -e "-------------------------------------------------"
-
     view_inbound_info
 }
 
@@ -407,11 +415,8 @@ EOF
 
 # 运行控制
 start_service() {
-    if [[ ! -f "${CERT_DIR}/fullchain.pem" || ! -f "${CERT_DIR}/privkey.pem" ]]; then
-        echo -e "${YELLOW}提示: 未检测到证书文件 (${CERT_DIR}/fullchain.pem)，若 WS-TLS 启用可能无法正常工作。${PLAIN}"
-    fi
     systemctl start xray
-    echo -e "${GREEN}Xray 服务已启动。${PLAIN}"
+    echo -e "${GREEN}Xray 服务已尝试启动。${PLAIN}"
     check_status
 }
 
@@ -493,13 +498,9 @@ uninstall_all() {
     exit 0
 }
 
-# 部署全局 xr 快捷命令（自克隆当前脚本）
+# 部署全局 xr 快捷命令（通过固定链接拉取脚本，避免进程替换失效）
 install_cli() {
-    cp -f "$0" "$CLI_TARGET" 2>/dev/null || true
-    if [[ ! -f "$CLI_TARGET" ]]; then
-        # 若是通过管道执行，则从原始脚本路径拉取或写入自身
-        cat "$0" > "$CLI_TARGET" 2>/dev/null || true
-    fi
+    curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_xray.sh -o "$CLI_TARGET"
     chmod +x "$CLI_TARGET"
     echo -e "${GREEN}快捷管理命令 'xr' 部署完成。${PLAIN}"
 }
@@ -566,7 +567,7 @@ main() {
                 setup_service
                 install_cli
 
-                systemctl start xray >/dev/null 2>&1 || true
+                systemctl restart xray >/dev/null 2>&1 || true
 
                 echo -e "\n${GREEN}=================================================${PLAIN}"
                 echo -e " Xray (${XRAY_VERSION}) 安装完成！"
