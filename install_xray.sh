@@ -250,6 +250,35 @@ view_inbound_info() {
             local r_link="vless://${r_uuid}@${server_ip}:${r_port}?encryption=none&flow=${r_flow}&security=reality&sni=${r_sni}&fp=chrome&pbk=${r_pub}&sid=${r_sid}&type=tcp&headerType=none#Xray-Reality"
             echo -e "  分享链接 (Link):"
             echo -e "  ${YELLOW}${r_link}${PLAIN}"
+            echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
+            jq -n \
+                --arg name "Xray-Reality" \
+                --arg server "$server_ip" \
+                --argjson port "$r_port" \
+                --arg uuid "$r_uuid" \
+                --arg flow "$r_flow" \
+                --arg sni "$r_sni" \
+                --arg public_key "$r_pub" \
+                --arg short_id "$r_sid" \
+                '{
+                  name: $name,
+                  type: "vless",
+                  server: $server,
+                  port: $port,
+                  udp: true,
+                  uuid: $uuid,
+                  flow: $flow,
+                  "packet-encoding": "xudp",
+                  encryption: "",
+                  tls: true,
+                  servername: $sni,
+                  "client-fingerprint": "chrome",
+                  network: "tcp",
+                  "reality-opts": {
+                    "public-key": $public_key,
+                    "short-id": $short_id
+                  }
+                }'
         fi
         echo -e "----------------------------------------------------------------"
     fi
@@ -276,6 +305,36 @@ view_inbound_info() {
         local ws_link="vless://${ws_uuid}@${ws_sni}:${ws_port}?encryption=none&security=tls&sni=${ws_sni}&fp=chrome&alpn=${ws_alpn_uri}&insecure=0&allowInsecure=0&type=ws&host=${ws_sni}&path=${ws_path_uri}#Xray-WS-TLS"
         echo -e "  分享链接 (Link):"
         echo -e "  ${YELLOW}${ws_link}${PLAIN}"
+        echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
+        jq -n \
+            --arg name "Xray-WS-TLS" \
+            --arg server "$ws_sni" \
+            --argjson port "$ws_port" \
+            --arg uuid "$ws_uuid" \
+            --arg sni "$ws_sni" \
+            --arg alpn "$ws_alpn" \
+            --arg path "$ws_path" \
+            '{
+              name: $name,
+              type: "vless",
+              server: $server,
+              port: $port,
+              udp: true,
+              uuid: $uuid,
+              encryption: "",
+              tls: true,
+              servername: $sni,
+              alpn: [$alpn],
+              "client-fingerprint": "chrome",
+              "skip-cert-verify": false,
+              network: "ws",
+              "ws-opts": {
+                path: $path,
+                headers: {
+                  Host: $sni
+                }
+              }
+            }'
         echo -e "----------------------------------------------------------------"
     fi
 
