@@ -7,3 +7,9 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_singbox.sh)
 
 ```
+
+## 2.xray安装脚本
+
+```shell
+bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_xray.sh)
+```
