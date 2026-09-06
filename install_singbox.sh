@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =========================================================
-# sing-box 一键安装、服务管理、BBR 调优与配置生成脚本
+# sing-box 一键安装、服务管理、BBR 调优、配置生成与节点查看脚本
 # =========================================================
 
 # 颜色配置
@@ -142,6 +142,93 @@ download_singbox() {
     echo -e "${GREEN}sing-box 二进制已就绪：${INSTALL_DIR}/sing-box${PLAIN}"
 }
 
+# 查看当前入站配置与分享链接
+view_inbound_info() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}未找到配置文件: ${CONFIG_FILE}，请先执行安装或生成配置！${PLAIN}"
+        return 1
+    fi
+
+    echo -e "\n${YELLOW}正在解析配置文件与服务器公网 IP...${PLAIN}"
+    local server_ip
+    server_ip=$(curl -s4m 6 https://api.ipify.org || curl -s4m 6 https://ip.sb || echo "YOUR_SERVER_IP")
+
+    # 解析 Reality 入站
+    local r_tag
+    r_tag=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+    
+    # 解析 WS-TLS 入站
+    local ws_tag
+    ws_tag=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+
+    echo -e "\n${CYAN}================================================================${PLAIN}"
+    echo -e "${CYAN}                     当前入站节点配置详情                       ${PLAIN}"
+    echo -e "${CYAN}================================================================${PLAIN}"
+
+    if [[ -n "$r_tag" ]]; then
+        local r_port r_uuid r_flow r_sni r_pri r_sid r_pub
+        r_port=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .listen_port' "$CONFIG_FILE")
+        r_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .users[0].uuid' "$CONFIG_FILE")
+        r_flow=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .users[0].flow' "$CONFIG_FILE")
+        r_sni=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tls.server_name' "$CONFIG_FILE")
+        r_pri=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tls.reality.private_key' "$CONFIG_FILE")
+        r_sid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tls.reality.short_id[0]' "$CONFIG_FILE")
+        
+        # 尝试通过私钥推导公钥，若失败尝试从配置备注/本地提取
+        r_pub=$(${INSTALL_DIR}/sing-box generate reality-keypair 2>/dev/null | grep -i "PublicKey:" | awk '{print $2}' || true)
+        # 如果 sing-box generate 只能生成成对密钥，我们改用已知匹配或在生成时留存
+        if [[ -f "${CONFIG_DIR}/reality_pub.key" ]]; then
+            r_pub=$(cat "${CONFIG_DIR}/reality_pub.key")
+        fi
+
+        echo -e "${GREEN}【协议 1: VLESS + Reality (直连推荐)】${PLAIN}"
+        echo -e "  地址 (Address):     ${CYAN}${server_ip}${PLAIN}"
+        echo -e "  端口 (Port):        ${CYAN}${r_port}${PLAIN}"
+        echo -e "  用户 ID (UUID):     ${CYAN}${r_uuid}${PLAIN}"
+        echo -e "  流控 (Flow):        ${CYAN}${r_flow}${PLAIN}"
+        echo -e "  加密 (Encryption):  ${CYAN}none${PLAIN}"
+        echo -e "  传输安全 (Security):${CYAN}reality${PLAIN}"
+        echo -e "  伪装域名 (SNI):     ${CYAN}${r_sni}${PLAIN}"
+        echo -e "  公钥 (PublicKey):   ${CYAN}${r_pub:-未找到记录}${PLAIN}"
+        echo -e "  Short ID:           ${CYAN}${r_sid}${PLAIN}"
+        
+        if [[ -n "$r_pub" ]]; then
+            local r_link="vless://${r_uuid}@${server_ip}:${r_port}?security=reality&encryption=none&pbk=${r_pub}&headerType=none&type=tcp&flow=${r_flow}&sni=${r_sni}&sid=${r_sid}#VLESS-Reality"
+            echo -e "  分享链接 (Link):"
+            echo -e "  ${YELLOW}${r_link}${PLAIN}"
+        fi
+        echo -e "----------------------------------------------------------------"
+    fi
+
+    if [[ -n "$ws_tag" ]]; then
+        local ws_port ws_uuid ws_sni ws_path
+        ws_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .listen_port' "$CONFIG_FILE")
+        ws_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .users[0].uuid' "$CONFIG_FILE")
+        ws_sni=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .tls.server_name' "$CONFIG_FILE")
+        ws_path=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .transport.path' "$CONFIG_FILE")
+
+        echo -e "${GREEN}【协议 2: VLESS + WS + TLS (支持 CDN/Cloudflare)】${PLAIN}"
+        echo -e "  地址 (Address):     ${CYAN}${ws_sni} (或填服务器 IP / CDN 优选 IP)${PLAIN}"
+        echo -e "  端口 (Port):        ${CYAN}${ws_port}${PLAIN}"
+        echo -e "  用户 ID (UUID):     ${CYAN}${ws_uuid}${PLAIN}"
+        echo -e "  加密 (Encryption):  ${CYAN}none${PLAIN}"
+        echo -e "  传输协议 (Network): ${CYAN}ws${PLAIN}"
+        echo -e "  传输安全 (Security):${CYAN}tls${PLAIN}"
+        echo -e "  伪装域名 (SNI/Host):${CYAN}${ws_sni}${PLAIN}"
+        echo -e "  路径 (Path):        ${CYAN}${ws_path}${PLAIN}"
+        
+        local ws_link="vless://${ws_uuid}@${ws_sni}:${ws_port}?security=tls&encryption=none&type=ws&host=${ws_sni}&path=${ws_path}#VLESS-WS-TLS"
+        echo -e "  分享链接 (Link):"
+        echo -e "  ${YELLOW}${ws_link}${PLAIN}"
+        echo -e "----------------------------------------------------------------"
+    fi
+
+    echo -e "${RED}证书目录检查:${PLAIN}"
+    echo -e "  公钥证书: ${CERT_DIR}/fullchain.pem $([[ -f "${CERT_DIR}/fullchain.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
+    echo -e "  私钥证书: ${CERT_DIR}/privkey.pem   $([[ -f "${CERT_DIR}/privkey.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
+    echo -e "${CYAN}================================================================${PLAIN}\n"
+}
+
 # 生成双入站与拦截大陆规则的配置
 generate_production_config() {
     mkdir -p "$CONFIG_DIR"
@@ -168,6 +255,9 @@ generate_production_config() {
     local public_key
     public_key=$(echo "$keypair" | grep -i "PublicKey:" | awk '{print $2}')
     
+    # 将生成的公钥留存一份备查
+    echo "$public_key" > "${CONFIG_DIR}/reality_pub.key"
+
     local short_id
     short_id=$(${INSTALL_DIR}/sing-box generate rand --hex 8)
 
@@ -272,27 +362,8 @@ generate_production_config() {
 }
 EOF
 
-    echo -e "${GREEN}配置文件写入成功！${PLAIN}"
-    echo -e "\n-------------------------------------------------"
-    echo -e "${RED}【重要提示：SSL证书准备】${PLAIN}"
-    echo -e "为确保 vless-ws-tls-in 正常工作，请务必将该域名的证书上传至："
-    echo -e "  - 证书公钥 (fullchain): ${YELLOW}${CERT_DIR}/fullchain.pem${PLAIN}"
-    echo -e "  - 证书私钥 (privkey):   ${YELLOW}${CERT_DIR}/privkey.pem${PLAIN}"
-    echo -e "-------------------------------------------------"
-
-    echo -e "\n${GREEN}=== 客户端连接参数备忘 ===${PLAIN}"
-    echo -e "共用 UUID:       ${CYAN}${uuid}${PLAIN}"
-    echo -e "1. VLESS-Reality:"
-    echo -e "   - 端口:       ${CYAN}443${PLAIN}"
-    echo -e "   - Flow:       ${CYAN}xtls-rprx-vision${PLAIN}"
-    echo -e "   - SNI / 伪装: ${CYAN}www.apple.com${PLAIN}"
-    echo -e "   - 公钥(pbk):  ${CYAN}${public_key}${PLAIN}"
-    echo -e "   - Short ID:   ${CYAN}${short_id}${PLAIN}"
-    echo -e "2. VLESS-WS-TLS:"
-    echo -e "   - 端口:       ${CYAN}8443${PLAIN} (支持搭配 Cloudflare 代理)"
-    echo -e "   - 域名/SNI:   ${CYAN}${ws_domain}${PLAIN}"
-    echo -e "   - 路径(path): ${CYAN}/ray${PLAIN}"
-    echo -e "-------------------------------------------------\n"
+    echo -e "${GREEN}配置文件生成并写入成功！${PLAIN}"
+    view_inbound_info
 }
 
 # 注册 Systemd 服务
@@ -320,7 +391,7 @@ EOF
     echo -e "${GREEN}Systemd 系统服务已注册。${PLAIN}"
 }
 
-# 管理与控制功能
+# 服务控制函数
 start_service() {
     if [[ ! -f "${CERT_DIR}/fullchain.pem" || ! -f "${CERT_DIR}/privkey.pem" ]]; then
         echo -e "${YELLOW}提示: 未检测到证书文件 (${CERT_DIR}/fullchain.pem)，若 WS-TLS 启用可能无法正常工作。${PLAIN}"
@@ -438,7 +509,7 @@ uninstall_all() {
     exit 0
 }
 
-# 注册自身为全局 sb 命令
+# 部署全局 sb 命令
 install_cli() {
     curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_singbox.sh -o "$CLI_TARGET"
     chmod +x "$CLI_TARGET"
@@ -455,27 +526,29 @@ ${GREEN}sing-box 服务管理工具 (sb)${PLAIN}
  3. 重启服务 (restart)
  4. 查看状态 (status)
  5. 查看实时日志 (log)
- 6. 检查配置文件 (check)
- 7. 编辑配置文件 (edit)
- 8. 重新生成双协议配置 (gen)
- 9. 更新 sing-box 内核 (update)
-10. BBR 状态与网络调优 (bbr)
-11. 卸载 sing-box (uninstall)
+ 6. 查看入站节点配置 (info)
+ 7. 检查配置文件 (check)
+ 8. 编辑配置文件 (edit)
+ 9. 重新生成双协议配置 (gen)
+10. 更新 sing-box 内核 (update)
+11. BBR 状态与网络调优 (bbr)
+12. 卸载 sing-box (uninstall)
  0. 退出
 ------------------------"
-    read -rp "请输入选项 [0-11]: " choice </dev/tty
+    read -rp "请输入选项 [0-12]: " choice </dev/tty
     case "$choice" in
         1) start_service ;;
         2) stop_service ;;
         3) restart_service ;;
         4) check_status ;;
         5) view_logs ;;
-        6) test_config ;;
-        7) edit_config ;;
-        8) generate_production_config ;;
-        9) update_core ;;
-        10) manage_bbr ;;
-        11) uninstall_all ;;
+        6) view_inbound_info ;;
+        7) test_config ;;
+        8) edit_config ;;
+        9) generate_production_config ;;
+        10) update_core ;;
+        11) manage_bbr ;;
+        12) uninstall_all ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效！${PLAIN}" ;;
     esac
@@ -489,6 +562,7 @@ main() {
         restart) restart_service ;;
         status) check_status ;;
         log) view_logs ;;
+        info) view_inbound_info ;;
         check) test_config ;;
         edit) edit_config ;;
         gen) generate_production_config ;;
@@ -497,11 +571,9 @@ main() {
         uninstall) uninstall_all ;;
         menu) show_menu ;;
         *)
-            # 如果是已经安装完成作为 sb 命令调用，且没有传参，则弹出菜单
             if [[ "$0" == *"/sb" ]]; then
                 show_menu
             else
-                # 首次通过 curl | bash 安装执行完整流程
                 install_deps
                 apply_bbr_and_optimization
                 download_singbox
@@ -515,7 +587,8 @@ main() {
                 echo -e " 安装完成！"
                 echo -e " 配置文件: ${CONFIG_FILE}"
                 echo -e " 证书目录: ${CERT_DIR}/"
-                echo -e " 全局快捷管理命令: ${YELLOW}sb${PLAIN}"
+                echo -e " 查看节点信息: ${YELLOW}sb info${PLAIN}"
+                echo -e " 全局管理工具: ${YELLOW}sb${PLAIN}"
                 echo -e "${GREEN}=================================================${PLAIN}"
             fi
             ;;
