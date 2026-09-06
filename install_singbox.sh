@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =========================================================
-# sing-box 一键安装、服务管理与 BBR 性能调优脚本
+# sing-box 一键安装、服务管理、BBR 调优与配置生成脚本
 # =========================================================
 
 set -e
@@ -9,10 +9,12 @@ set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
 INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/sing-box"
+CERT_DIR="${CONFIG_DIR}/cert"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 SYSTEMD_FILE="/etc/systemd/system/sing-box.service"
 CLI_LINK="/usr/local/bin/sb"
@@ -62,11 +64,8 @@ detect_arch() {
 # BBR 与网络栈调优
 apply_bbr_and_optimization() {
     echo -e "${YELLOW}正在配置 BBR 拥塞控制及 Linux 网络栈优化...${PLAIN}"
-
-    # 尝试加载内核模块（部分虚拟化或定制内核需显式加载）
     modprobe tcp_bbr >/dev/null 2>&1 || true
 
-    # 写入 sysctl 优化参数
     cat << 'EOF' > "$SYSCTL_BBR_FILE"
 # 拥塞控制与排队算法 (BBR)
 net.core.default_qdisc = fq
@@ -101,7 +100,6 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.ip_local_port_range = 1024 65535
 EOF
 
-    # 写入系统文件句柄并发数限制
     mkdir -p /etc/security/limits.d
     cat << 'EOF' > "$LIMITS_FILE"
 * soft nofile 1048576
@@ -110,16 +108,10 @@ root soft nofile 1048576
 root hard nofile 1048576
 EOF
 
-    # 刷新配置
     sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_BBR_FILE" >/dev/null 2>&1
-
     local cc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    if [[ "$cc" == "bbr" ]]; then
-        echo -e "${GREEN}BBR 算法启用成功 (当前拥塞控制: ${cc})。${PLAIN}"
-    else
-        echo -e "${YELLOW}注意: 内核设置已下发，当前拥塞控制为 ${cc}（若内核版本低于 4.9 可能不支持 BBR）。${PLAIN}"
-    fi
+    echo -e "${GREEN}网络栈调优完成，当前拥塞控制算法: ${cc}${PLAIN}"
 }
 
 # 获取并下载最新版本 sing-box
@@ -152,34 +144,158 @@ download_singbox() {
     echo -e "${GREEN}sing-box 二进制已就绪：${INSTALL_DIR}/sing-box${PLAIN}"
 }
 
-# 部署默认配置文件
-setup_config() {
+# 生成包含 Dual-Inbound 与 CN-Block 规则的生产配置文件
+generate_production_config() {
     mkdir -p "$CONFIG_DIR"
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        cat << 'EOF' > "$CONFIG_FILE"
+    mkdir -p "$CERT_DIR"
+
+    echo -e "\n${CYAN}=================================================${PLAIN}"
+    echo -e "${CYAN}      sing-box 节点配置生成器 (Dual-Inbound)       ${PLAIN}"
+    echo -e "${CYAN}=================================================${PLAIN}"
+
+    local ws_domain=""
+    while [[ -z "$ws_domain" ]]; do
+        read -rp "请输入 vless-ws-tls-in 绑定的域名 (例如: node.yourdomain.com): " ws_domain
+        ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
+    done
+
+    echo -e "${YELLOW}正在自动生成 UUID、Reality 密钥对与 Short-ID...${PLAIN}"
+    local uuid
+    uuid=$(${INSTALL_DIR}/sing-box generate uuid)
+    
+    local keypair
+    keypair=$(${INSTALL_DIR}/sing-box generate reality-keypair)
+    local private_key
+    private_key=$(echo "$keypair" | grep -i "PrivateKey:" | awk '{print $2}')
+    local public_key
+    public_key=$(echo "$keypair" | grep -i "PublicKey:" | awk '{print $2}')
+    
+    local short_id
+    short_id=$(${INSTALL_DIR}/sing-box generate rand --hex 8)
+
+    cat << EOF > "$CONFIG_FILE"
 {
   "log": {
+    "disabled": false,
     "level": "info",
     "timestamp": true
   },
   "inbounds": [
     {
-      "type": "mixed",
-      "tag": "mixed-in",
+      "type": "vless",
+      "tag": "vless-reality-in",
       "listen": "::",
-      "listen_port": 1080
+      "listen_port": 443,
+      "users": [
+        {
+          "uuid": "${uuid}",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.apple.com",
+            "server_port": 443
+          },
+          "private_key": "${private_key}",
+          "short_id": [
+            "${short_id}"
+          ]
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws-tls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "users": [
+        {
+          "uuid": "${uuid}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${ws_domain}",
+        "certificate_path": "${CERT_DIR}/fullchain.pem",
+        "key_path": "${CERT_DIR}/privkey.pem"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/ray",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
     }
   ],
   "outbounds": [
     {
       "type": "direct",
       "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
     }
-  ]
+  ],
+  "route": {
+    "rules": [
+      {
+        "rule_set": [
+          "geosite-cn",
+          "geoip-cn"
+        ],
+        "outbound": "block"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+        "download_detour": "direct"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        "download_detour": "direct"
+      }
+    ],
+    "final": "direct",
+    "auto_detect_interface": true
+  }
 }
 EOF
-        echo -e "${GREEN}已创建基础示例配置文件：${CONFIG_FILE}${PLAIN}"
-    fi
+
+    echo -e "${GREEN}配置文件写入成功！${PLAIN}"
+    echo -e "\n-------------------------------------------------"
+    echo -e "${RED}【重要提示：SSL证书准备】${PLAIN}"
+    echo -e "为确保 vless-ws-tls-in 正常工作，请务必将该域名的证书上传至："
+    echo -e "  - 证书公钥 (fullchain): ${YELLOW}${CERT_DIR}/fullchain.pem${PLAIN}"
+    echo -e "  - 证书私钥 (privkey):   ${YELLOW}${CERT_DIR}/privkey.pem${PLAIN}"
+    echo -e "（提示：在证书就绪前，如果尝试启动包含 TLS 的服务，sing-box 会因找不到证书报错）"
+    echo -e "-------------------------------------------------"
+
+    echo -e "\n${GREEN}=== 客户端连接参数备忘 ===${PLAIN}"
+    echo -e "共用 UUID:       ${CYAN}${uuid}${PLAIN}"
+    echo -e "1. VLESS-Reality:"
+    echo -e "   - 端口:       ${CYAN}443${PLAIN}"
+    echo -e "   - Flow:       ${CYAN}xtls-rprx-vision${PLAIN}"
+    echo -e "   - SNI / 伪装: ${CYAN}www.apple.com${PLAIN}"
+    echo -e "   - 公钥(pbk):  ${CYAN}${public_key}${PLAIN}"
+    echo -e "   - Short ID:   ${CYAN}${short_id}${PLAIN}"
+    echo -e "2. VLESS-WS-TLS:"
+    echo -e "   - 端口:       ${CYAN}8443${PLAIN} (支持搭配 Cloudflare 代理)"
+    echo -e "   - 域名/SNI:   ${CYAN}${ws_domain}${PLAIN}"
+    echo -e "   - 路径(path): ${CYAN}/ray${PLAIN}"
+    echo -e "-------------------------------------------------\n"
 }
 
 # 注册 Systemd 服务
@@ -204,10 +320,10 @@ EOF
 
     systemctl daemon-reload
     systemctl enable sing-box >/dev/null 2>&1
-    echo -e "${GREEN}Systemd 系统服务已注册并配置为开机自启。${PLAIN}"
+    echo -e "${GREEN}Systemd 系统服务已注册并设置为开机自启。${PLAIN}"
 }
 
-# 创建全局 sb 命令行管理工具
+# 创建全局快捷管理脚本
 setup_cli() {
     cat << 'EOF' > "$CLI_LINK"
 #!/usr/bin/env bash
@@ -215,10 +331,13 @@ setup_cli() {
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
 PLAIN='\033[0m'
 
 INSTALL_DIR="/usr/local/bin"
-CONFIG_FILE="/etc/sing-box/config.json"
+CONFIG_DIR="/etc/sing-box"
+CERT_DIR="${CONFIG_DIR}/cert"
+CONFIG_FILE="${CONFIG_DIR}/config.json"
 SYSTEMD_FILE="/etc/systemd/system/sing-box.service"
 SYSCTL_BBR_FILE="/etc/sysctl.d/99-network-bbr.conf"
 LIMITS_FILE="/etc/security/limits.d/99-nofile.conf"
@@ -248,12 +367,13 @@ ${GREEN}sing-box 服务管理工具 (sb)${PLAIN}
  5. 查看实时日志 (log)
  6. 检查配置文件 (check)
  7. 编辑配置文件 (edit)
- 8. 更新 sing-box (update)
- 9. BBR状态与网络调优 (bbr)
-10. 卸载 sing-box (uninstall)
+ 8. 重新生成双协议配置 (gen)
+ 9. 更新 sing-box 内核 (update)
+10. BBR 状态与网络调优 (bbr)
+11. 卸载 sing-box (uninstall)
  0. 退出
 ------------------------"
-    read -rp "请输入选项 [0-10]: " choice
+    read -rp "请输入选项 [0-11]: " choice
     case "$choice" in
         1) start_service ;;
         2) stop_service ;;
@@ -262,17 +382,21 @@ ${GREEN}sing-box 服务管理工具 (sb)${PLAIN}
         5) view_logs ;;
         6) test_config ;;
         7) edit_config ;;
-        8) update_core ;;
-        9) manage_bbr ;;
-        10) uninstall_all ;;
+        8) generate_config_cli ;;
+        9) update_core ;;
+        10) manage_bbr ;;
+        11) uninstall_all ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效！${PLAIN}" ;;
     esac
 }
 
 start_service() {
+    if [[ ! -f "${CERT_DIR}/fullchain.pem" || ! -f "${CERT_DIR}/privkey.pem" ]]; then
+        echo -e "${YELLOW}警告: 检测到证书文件不存在于 ${CERT_DIR}，若已配置 WS-TLS 则服务将无法启动。${PLAIN}"
+    fi
     systemctl start sing-box
-    echo -e "${GREEN}sing-box 已尝试启动。${PLAIN}"
+    echo -e "${GREEN}sing-box 已发送启动指令。${PLAIN}"
     check_status
 }
 
@@ -314,6 +438,138 @@ edit_config() {
     else
         echo -e "${RED}配置文件存在语法错误，请手动修正！${PLAIN}"
     fi
+}
+
+generate_config_cli() {
+    mkdir -p "$CERT_DIR"
+    local ws_domain=""
+    while [[ -z "$ws_domain" ]]; do
+        read -rp "请输入 vless-ws-tls-in 绑定的域名: " ws_domain
+        ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
+    done
+
+    echo -e "${YELLOW}正在生成配置参数...${PLAIN}"
+    local uuid=$(${INSTALL_DIR}/sing-box generate uuid)
+    local keypair=$(${INSTALL_DIR}/sing-box generate reality-keypair)
+    local private_key=$(echo "$keypair" | grep -i "PrivateKey:" | awk '{print $2}')
+    local public_key=$(echo "$keypair" | grep -i "PublicKey:" | awk '{print $2}')
+    local short_id=$(${INSTALL_DIR}/sing-box generate rand --hex 8)
+
+    cat << EOF > "$CONFIG_FILE"
+{
+  "log": {
+    "disabled": false,
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "uuid": "${uuid}",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.apple.com",
+            "server_port": 443
+          },
+          "private_key": "${private_key}",
+          "short_id": [
+            "${short_id}"
+          ]
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-ws-tls-in",
+      "listen": "::",
+      "listen_port": 8443,
+      "users": [
+        {
+          "uuid": "${uuid}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${ws_domain}",
+        "certificate_path": "${CERT_DIR}/fullchain.pem",
+        "key_path": "${CERT_DIR}/privkey.pem"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/ray",
+        "max_early_data": 2048,
+        "early_data_header_name": "Sec-WebSocket-Protocol"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "rule_set": [
+          "geosite-cn",
+          "geoip-cn"
+        ],
+        "outbound": "block"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
+        "download_detour": "direct"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        "download_detour": "direct"
+      }
+    ],
+    "final": "direct",
+    "auto_detect_interface": true
+  }
+}
+EOF
+
+    echo -e "${GREEN}配置已生成并写入 ${CONFIG_FILE}${PLAIN}"
+    echo -e "\n-------------------------------------------------"
+    echo -e "${RED}【证书放置提醒】${PLAIN}"
+    echo -e "公钥路径: ${YELLOW}${CERT_DIR}/fullchain.pem${PLAIN}"
+    echo -e "私钥路径: ${YELLOW}${CERT_DIR}/privkey.pem${PLAIN}"
+    echo -e "-------------------------------------------------"
+    echo -e "UUID:        ${CYAN}${uuid}${PLAIN}"
+    echo -e "Reality 公钥: ${CYAN}${public_key}${PLAIN}"
+    echo -e "Reality 短ID: ${CYAN}${short_id}${PLAIN}"
+    echo -e "WS 域名:     ${CYAN}${ws_domain}${PLAIN}"
+    echo -e "-------------------------------------------------"
+
+    read -rp "是否立即重启 sing-box 服务？[y/N]: " re_ans
+    [[ "$re_ans" =~ ^[Yy]$ ]] && restart_service
 }
 
 update_core() {
@@ -368,8 +624,8 @@ uninstall_all() {
     rm -f "${INSTALL_DIR}/sing-box"
     rm -f "/usr/local/bin/sb"
 
-    read -rp "是否删除配置文件目录 (${CONFIG_FILE%/*})？[y/N]: " del_cfg
-    [[ "$del_cfg" =~ ^[Yy]$ ]] && rm -rf "${CONFIG_FILE%/*}"
+    read -rp "是否删除配置文件与证书目录 (${CONFIG_DIR})？[y/N]: " del_cfg
+    [[ "$del_cfg" =~ ^[Yy]$ ]] && rm -rf "$CONFIG_DIR"
 
     read -rp "是否还原/删除 BBR 与网络优化配置文件？[y/N]: " del_bbr
     if [[ "$del_bbr" =~ ^[Yy]$ ]]; then
@@ -390,6 +646,7 @@ case "$1" in
     log) view_logs ;;
     check) test_config ;;
     edit) edit_config ;;
+    gen) generate_config_cli ;;
     update) update_core ;;
     bbr) manage_bbr ;;
     uninstall) uninstall_all ;;
@@ -405,15 +662,21 @@ main() {
     install_deps
     apply_bbr_and_optimization
     download_singbox
-    setup_config
+    generate_production_config
     setup_service
     setup_cli
 
-    systemctl start sing-box
+    # 尝试启动（如果用户尚未放证书，可能启动失败，给出温和提示）
+    if systemctl start sing-box >/dev/null 2>&1; then
+        echo -e "${GREEN}sing-box 服务已自动启动！${PLAIN}"
+    else
+        echo -e "${YELLOW}服务已注册。由于证书文件 (${CERT_DIR}/fullchain.pem) 尚未放入，服务将在您放置证书后运行。${PLAIN}"
+    fi
+
     echo -e "\n${GREEN}=================================================${PLAIN}"
-    echo -e "${GREEN} sing-box 安装成功，BBR 与网络栈优化已生效！${PLAIN}"
     echo -e " 配置文件: ${CONFIG_FILE}"
-    echo -e " 快速管理命令: ${YELLOW}sb${PLAIN} (可直接使用 sb start/stop/status/bbr 等)"
+    echo -e " 证书目录: ${CERT_DIR}/"
+    echo -e " 快速管理命令: ${YELLOW}sb${PLAIN} (支持 sb gen 重新配置, sb log 查看日志等)"
     echo -e "${GREEN}=================================================${PLAIN}"
 }
 
