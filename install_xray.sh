@@ -247,7 +247,7 @@ view_inbound_info() {
         echo -e "  Short ID:           ${CYAN}${r_sid}${PLAIN}"
 
         if [[ -n "$r_pub" ]]; then
-            local r_link="vless://${r_uuid}@${server_ip}:${r_port}?security=reality&encryption=none&pbk=${r_pub}&headerType=none&type=tcp&flow=${r_flow}&sni=${r_sni}&sid=${r_sid}#Xray-Reality"
+            local r_link="vless://${r_uuid}@${server_ip}:${r_port}?encryption=none&flow=${r_flow}&security=reality&sni=${r_sni}&fp=chrome&pbk=${r_pub}&sid=${r_sid}&type=tcp&headerType=none#Xray-Reality"
             echo -e "  分享链接 (Link):"
             echo -e "  ${YELLOW}${r_link}${PLAIN}"
         fi
@@ -255,11 +255,14 @@ view_inbound_info() {
     fi
 
     if [[ -n "$ws_tag" ]]; then
-        local ws_port ws_uuid ws_sni ws_path
+        local ws_port ws_uuid ws_sni ws_path ws_alpn ws_path_uri ws_alpn_uri
         ws_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .port' "$CONFIG_FILE")
         ws_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .settings.clients[0].id' "$CONFIG_FILE")
         ws_sni=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
         ws_path=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .streamSettings.wsSettings.path' "$CONFIG_FILE")
+        ws_alpn=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | (.streamSettings.tlsSettings.alpn[0] // "http/1.1")' "$CONFIG_FILE")
+        ws_path_uri=${ws_path//\//%2F}
+        ws_alpn_uri=${ws_alpn//\//%2F}
 
         echo -e "${GREEN}【协议 2: VLESS + WS + TLS (支持 CDN 回源)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${ws_sni} (或填服务器IP/CDN优选IP)${PLAIN}"
@@ -270,7 +273,7 @@ view_inbound_info() {
         echo -e "  伪装域名 (SNI/Host):${CYAN}${ws_sni}${PLAIN}"
         echo -e "  路径 (Path):        ${CYAN}${ws_path}${PLAIN}"
 
-        local ws_link="vless://${ws_uuid}@${ws_sni}:${ws_port}?security=tls&encryption=none&type=ws&host=${ws_sni}&path=${ws_path}#Xray-WS-TLS"
+        local ws_link="vless://${ws_uuid}@${ws_sni}:${ws_port}?encryption=none&security=tls&sni=${ws_sni}&fp=chrome&alpn=${ws_alpn_uri}&insecure=0&allowInsecure=0&type=ws&host=${ws_sni}&path=${ws_path_uri}#Xray-WS-TLS"
         echo -e "  分享链接 (Link):"
         echo -e "  ${YELLOW}${ws_link}${PLAIN}"
         echo -e "----------------------------------------------------------------"
@@ -396,6 +399,9 @@ generate_production_config() {
         "security": "tls",
         "tlsSettings": {
           "serverName": "${ws_domain}",
+          "alpn": [
+            "http/1.1"
+          ],
           "certificates": [
             {
               "certificateFile": "${CERT_DIR}/fullchain.pem",
