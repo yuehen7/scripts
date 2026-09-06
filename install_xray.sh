@@ -43,7 +43,7 @@ install_deps() {
     fi
 }
 
-# 检测系统架构
+# 检测系统架构匹配 Xray Release 文件名
 detect_arch() {
     local arch
     arch=$(uname -m)
@@ -164,15 +164,21 @@ view_inbound_info() {
     echo -e "${CYAN}================================================================${PLAIN}"
 
     if [[ -n "$r_tag" ]]; then
-        local r_port r_uuid r_flow r_sni r_sid r_pub
+        local r_port r_uuid r_flow r_sni r_sid r_pri r_pub
         r_port=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .port' "$CONFIG_FILE")
         r_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .settings.clients[0].id' "$CONFIG_FILE")
         r_flow=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .settings.clients[0].flow' "$CONFIG_FILE")
         r_sni=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.serverNames[0]' "$CONFIG_FILE")
+        r_pri=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.privateKey' "$CONFIG_FILE")
         r_sid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.shortIds[0]' "$CONFIG_FILE")
 
-        if [[ -f "${CONFIG_DIR}/reality_pub.key" ]]; then
-            r_pub=$(cat "${CONFIG_DIR}/reality_pub.key")
+        # 优先从文件读取，若文件缺失则直接由私钥逆向推导公钥
+        if [[ -s "${CONFIG_DIR}/reality_pub.key" ]]; then
+            r_pub=$(cat "${CONFIG_DIR}/reality_pub.key" | tr -d '[:space:]')
+        fi
+        if [[ -z "$r_pub" && -n "$r_pri" ]]; then
+            r_pub=$(${INSTALL_DIR}/xray x25519 -i "$r_pri" 2>/dev/null | grep -iE 'Public[[:space:]]*key' | sed -E 's/.*:[[:space:]]*//' | tr -d '[:space:]')
+            [[ -n "$r_pub" ]] && echo "$r_pub" > "${CONFIG_DIR}/reality_pub.key"
         fi
 
         echo -e "${GREEN}【协议 1: VLESS + Reality (直连推荐)】${PLAIN}"
@@ -237,16 +243,22 @@ generate_production_config() {
         ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
     done
 
-    echo -e "${YELLOW}生成秘钥参数中...${PLAIN}"
+    echo -e "${YELLOW}生成密钥参数中...${PLAIN}"
     local uuid
     uuid=$(${INSTALL_DIR}/xray uuid)
 
+    # 精确匹配提取 private_key 与 public_key
     local keypair
     keypair=$(${INSTALL_DIR}/xray x25519)
     local private_key
-    private_key=$(echo "$keypair" | grep -i "Private key:" | awk '{print $3}')
+    private_key=$(echo "$keypair" | grep -iE 'Private[[:space:]]*key' | sed -E 's/.*:[[:space:]]*//' | tr -d '[:space:]')
     local public_key
-    public_key=$(echo "$keypair" | grep -i "Public key:" | awk '{print $3}')
+    public_key=$(echo "$keypair" | grep -iE 'Public[[:space:]]*key' | sed -E 's/.*:[[:space:]]*//' | tr -d '[:space:]')
+
+    # 双重保障：若提取失败，使用 -i 显式推导
+    if [[ -z "$public_key" && -n "$private_key" ]]; then
+        public_key=$(${INSTALL_DIR}/xray x25519 -i "$private_key" | grep -iE 'Public[[:space:]]*key' | sed -E 's/.*:[[:space:]]*//' | tr -d '[:space:]')
+    fi
 
     echo "$public_key" > "${CONFIG_DIR}/reality_pub.key"
 
@@ -546,7 +558,6 @@ main() {
         uninstall) uninstall_all ;;
         menu) show_menu ;;
         "")
-            # 关键修复：只要是本地以 xr 形式直接运行且无参数，一律打开交互菜单
             if [[ "$0" == *"/xr" || "$0" == "xr" ]]; then
                 show_menu
             else
