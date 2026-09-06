@@ -43,7 +43,7 @@ install_deps() {
     fi
 }
 
-# 检测系统架构匹配 Xray Release 文件名
+# 检测系统架构
 detect_arch() {
     local arch
     arch=$(uname -m)
@@ -66,11 +66,8 @@ apply_bbr_and_optimization() {
     modprobe tcp_bbr >/dev/null 2>&1 || true
 
     cat << 'EOF' > "$SYSCTL_BBR_FILE"
-# 拥塞控制与排队算法 (BBR)
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-
-# TCP 缓冲区与滑动窗口
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.core.rmem_default = 1048576
@@ -80,14 +77,10 @@ net.ipv4.tcp_wmem = 4096 65536 67108864
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
-
-# 队列与高并发
 net.core.netdev_max_backlog = 10000
 net.core.somaxconn = 32768
 net.ipv4.tcp_max_syn_backlog = 8192
 net.ipv4.tcp_syncookies = 1
-
-# 连接复用与超时清理
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_max_tw_buckets = 50000
@@ -110,7 +103,7 @@ EOF
     sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_BBR_FILE" >/dev/null 2>&1
     local cc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    echo -e "${GREEN}网络栈调优完成，当前拥塞控制算法: ${cc}${PLAIN}"
+    echo -e "${GREEN}网络栈调优完成，当前算法: ${cc}${PLAIN}"
 }
 
 # 下载固定版本 v26.6.27 的 Xray
@@ -120,12 +113,10 @@ download_xray() {
     local url="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/${filename}"
 
     echo -e "${GREEN}下载固定版本: ${XRAY_VERSION} (架构: ${ARCH})${PLAIN}"
-    echo -e "${YELLOW}下载地址: ${url}${PLAIN}"
-
     local tmp_dir
     tmp_dir=$(mktemp -d)
     if ! curl -L -f -o "${tmp_dir}/${filename}" "$url"; then
-        echo -e "${RED}下载 Xray 失败，请检查网络连接或确认该架构包是否存在！${PLAIN}"
+        echo -e "${RED}下载 Xray 失败，请检查网络！${PLAIN}"
         rm -rf "$tmp_dir"
         exit 1
     fi
@@ -135,35 +126,32 @@ download_xray() {
     mv "${tmp_dir}/xray" "${INSTALL_DIR}/xray"
     chmod +x "${INSTALL_DIR}/xray"
 
-    # 移动地理路由规则库到配置目录
     [[ -f "${tmp_dir}/geoip.dat" ]] && mv "${tmp_dir}/geoip.dat" "${CONFIG_DIR}/"
     [[ -f "${tmp_dir}/geosite.dat" ]] && mv "${tmp_dir}/geosite.dat" "${CONFIG_DIR}/"
 
     rm -rf "$tmp_dir"
-    echo -e "${GREEN}Xray 二进制安装完成: ${INSTALL_DIR}/xray${PLAIN}"
+    echo -e "${GREEN}Xray 二进制已就绪: ${INSTALL_DIR}/xray${PLAIN}"
 }
 
-# 确保证书文件存在，不存在则自动生成占位临时自签名证书防启动崩溃
+# 证书占位处理
 ensure_dummy_cert() {
     mkdir -p "$CERT_DIR"
     if [[ ! -f "${CERT_DIR}/fullchain.pem" || ! -f "${CERT_DIR}/privkey.pem" ]]; then
-        echo -e "${YELLOW}未检测到 SSL 证书，正在生成临时自签名证书以保证服务顺利启动...${PLAIN}"
+        echo -e "${YELLOW}生成初始临时自签名证书...${PLAIN}"
         openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
             -keyout "${CERT_DIR}/privkey.pem" \
             -out "${CERT_DIR}/fullchain.pem" \
             -subj "/CN=temporary.cert" >/dev/null 2>&1 || true
-        echo -e "${YELLOW}临时证书已就绪。后续请将该域名的真实证书覆盖至此目录。${PLAIN}"
     fi
 }
 
-# 查看节点参数与客户端链接
+# 查看节点配置与分享链接
 view_inbound_info() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        echo -e "${RED}未找到配置文件: ${CONFIG_FILE}，请先执行安装或重新生成配置！${PLAIN}"
+        echo -e "${RED}未找到配置文件: ${CONFIG_FILE}${PLAIN}"
         return 1
     fi
 
-    echo -e "\n${YELLOW}正在解析配置文件与服务器公网 IP...${PLAIN}"
     local server_ip
     server_ip=$(curl -s4m 6 https://api.ipify.org || curl -s4m 6 https://ip.sb || echo "YOUR_SERVER_IP")
 
@@ -192,10 +180,9 @@ view_inbound_info() {
         echo -e "  端口 (Port):        ${CYAN}${r_port}${PLAIN}"
         echo -e "  用户 ID (UUID):     ${CYAN}${r_uuid}${PLAIN}"
         echo -e "  流控 (Flow):        ${CYAN}${r_flow}${PLAIN}"
-        echo -e "  加密 (Encryption):  ${CYAN}none${PLAIN}"
-        echo -e "  传输安全 (Security):${CYAN}reality${PLAIN}"
+        echo -e "  传输协议 (Network): tcp"
         echo -e "  伪装域名 (SNI):     ${CYAN}${r_sni}${PLAIN}"
-        echo -e "  公钥 (PublicKey):   ${CYAN}${r_pub:-未找到记录}${PLAIN}"
+        echo -e "  公钥 (PublicKey):   ${CYAN}${r_pub:-未找到}${PLAIN}"
         echo -e "  Short ID:           ${CYAN}${r_sid}${PLAIN}"
 
         if [[ -n "$r_pub" ]]; then
@@ -213,13 +200,12 @@ view_inbound_info() {
         ws_sni=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
         ws_path=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .streamSettings.wsSettings.path' "$CONFIG_FILE")
 
-        echo -e "${GREEN}【协议 2: VLESS + WS + TLS (支持 CDN/Cloudflare 回源)】${PLAIN}"
-        echo -e "  地址 (Address):     ${CYAN}${ws_sni} (或填服务器 IP / CDN 优选 IP)${PLAIN}"
+        echo -e "${GREEN}【协议 2: VLESS + WS + TLS (支持 CDN 回源)】${PLAIN}"
+        echo -e "  地址 (Address):     ${CYAN}${ws_sni} (或填服务器IP/CDN优选IP)${PLAIN}"
         echo -e "  端口 (Port):        ${CYAN}${ws_port}${PLAIN}"
         echo -e "  用户 ID (UUID):     ${CYAN}${ws_uuid}${PLAIN}"
-        echo -e "  加密 (Encryption):  ${CYAN}none${PLAIN}"
-        echo -e "  传输协议 (Network): ${CYAN}ws${PLAIN}"
-        echo -e "  传输安全 (Security):${CYAN}tls${PLAIN}"
+        echo -e "  传输协议 (Network): ws"
+        echo -e "  传输安全 (Security):tls"
         echo -e "  伪装域名 (SNI/Host):${CYAN}${ws_sni}${PLAIN}"
         echo -e "  路径 (Path):        ${CYAN}${ws_path}${PLAIN}"
 
@@ -235,7 +221,7 @@ view_inbound_info() {
     echo -e "${CYAN}================================================================${PLAIN}\n"
 }
 
-# 生成 Xray 配置文件
+# 规范化写入标准 Xray 配置
 generate_production_config() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$CERT_DIR"
@@ -247,11 +233,11 @@ generate_production_config() {
 
     local ws_domain=""
     while [[ -z "$ws_domain" ]]; do
-        read -rp "请输入 vless-ws-tls-in 绑定的域名 (例如: node.yourdomain.com): " ws_domain </dev/tty
+        read -rp "请输入 vless-ws-tls-in 绑定的域名: " ws_domain </dev/tty
         ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
     done
 
-    echo -e "${YELLOW}正在自动生成 UUID、Reality 密钥对与 Short-ID...${PLAIN}"
+    echo -e "${YELLOW}生成秘钥参数中...${PLAIN}"
     local uuid
     uuid=$(${INSTALL_DIR}/xray uuid)
 
@@ -276,6 +262,7 @@ generate_production_config() {
     {
       "tag": "vless-reality-in",
       "port": 443,
+      "listen": "::",
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -310,6 +297,7 @@ generate_production_config() {
     {
       "tag": "vless-ws-tls-in",
       "port": 8443,
+      "listen": "::",
       "protocol": "vless",
       "settings": {
         "clients": [
@@ -413,10 +401,10 @@ EOF
     echo -e "${GREEN}Systemd 系统服务已注册并配置为开机自启。${PLAIN}"
 }
 
-# 运行控制
+# 状态控制
 start_service() {
     systemctl start xray
-    echo -e "${GREEN}Xray 服务已尝试启动。${PLAIN}"
+    echo -e "${GREEN}Xray 服务已启动。${PLAIN}"
     check_status
 }
 
@@ -436,6 +424,7 @@ check_status() {
         echo -e "运行状态: ${GREEN}运行中 (Active)${PLAIN}"
     else
         echo -e "运行状态: ${RED}未运行 (Inactive)${PLAIN}"
+        echo -e "${YELLOW}提示: 若启动失败，可运行 'xr test' 查看具体配置报错行${PLAIN}"
     fi
 }
 
@@ -498,7 +487,7 @@ uninstall_all() {
     exit 0
 }
 
-# 部署全局 xr 快捷命令（通过固定链接拉取脚本，避免进程替换失效）
+# 部署全局 xr 快捷命令
 install_cli() {
     curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_xray.sh -o "$CLI_TARGET"
     chmod +x "$CLI_TARGET"
@@ -516,7 +505,7 @@ ${GREEN}Xray (${XRAY_VERSION}) 服务管理工具 (xr)${PLAIN}
  4. 查看状态 (status)
  5. 查看实时日志 (log)
  6. 查看入站节点配置 (info)
- 7. 检查配置文件 (check)
+ 7. 检查配置文件 (check/test)
  8. 编辑配置文件 (edit)
  9. 重新生成双协议配置 (gen)
 10. BBR 状态与网络调优 (bbr)
@@ -541,7 +530,7 @@ ${GREEN}Xray (${XRAY_VERSION}) 服务管理工具 (xr)${PLAIN}
     esac
 }
 
-# 主执行流程
+# 命令分发
 main() {
     case "$1" in
         start) start_service ;;
@@ -550,14 +539,15 @@ main() {
         status) check_status ;;
         log) view_logs ;;
         info) view_inbound_info ;;
-        check) test_config ;;
+        check|test) test_config ;;
         edit) edit_config ;;
         gen) generate_production_config ;;
         bbr) manage_bbr ;;
         uninstall) uninstall_all ;;
         menu) show_menu ;;
-        *)
-            if [[ "$0" == *"/xr" ]]; then
+        "")
+            # 关键修复：只要是本地以 xr 形式直接运行且无参数，一律打开交互菜单
+            if [[ "$0" == *"/xr" || "$0" == "xr" ]]; then
                 show_menu
             else
                 install_deps
@@ -577,6 +567,10 @@ main() {
                 echo -e " 全局管理工具: ${YELLOW}xr${PLAIN}"
                 echo -e "${GREEN}=================================================${PLAIN}"
             fi
+            ;;
+        *)
+            echo -e "${RED}未知子命令: $1${PLAIN}"
+            show_menu
             ;;
     esac
 }
