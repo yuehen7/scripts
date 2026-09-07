@@ -508,6 +508,14 @@ generate_production_config() {
   "log": {
     "loglevel": "warning"
   },
+  "dns": {
+    "servers": [
+      "8.8.8.8",
+      "1.1.1.1",
+      "2001:4860:4860::8888",
+      "2606:4700:4700::1111"
+    ]
+  },
   "inbounds": [
     {
       "tag": "vless-reality-in",
@@ -541,7 +549,7 @@ generate_production_config() {
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": ["http", "tls", "quic"]
       }
     },
     {
@@ -578,7 +586,7 @@ generate_production_config() {
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": ["http", "tls", "quic"]
       }
     },
     {
@@ -616,7 +624,7 @@ generate_production_config() {
       },
       "sniffing": {
         "enabled": true,
-        "destOverride": ["http", "tls"]
+        "destOverride": ["http", "tls", "quic"]
       }
     }
   ],
@@ -637,7 +645,6 @@ generate_production_config() {
         "type": "field",
         "outboundTag": "blocked",
         "domain": [
-          "geosite:cn",
           "geosite:category-ads-all"
         ]
       },
@@ -645,14 +652,8 @@ generate_production_config() {
         "type": "field",
         "outboundTag": "blocked",
         "ip": [
-          "geoip:cn",
           "geoip:private"
         ]
-      },
-      {
-        "type": "field",
-        "outboundTag": "direct",
-        "network": "tcp,udp"
       }
     ]
   }
