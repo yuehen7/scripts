@@ -229,7 +229,7 @@ view_inbound_info() {
     echo -e "${CYAN}================================================================${PLAIN}\n"
 }
 
-# 生成双入站与拦截大陆规则的配置
+# 生成双入站、嗅探与基础拦截规则的配置
 generate_production_config() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$CERT_DIR"
@@ -324,35 +324,35 @@ generate_production_config() {
     {
       "type": "direct",
       "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
     }
   ],
   "route": {
     "rules": [
       {
+        "action": "sniff",
+        "sniffer": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      {
         "rule_set": [
-          "geosite-cn",
-          "geoip-cn"
+          "geosite-category-ads-all"
         ],
-        "outbound": "block"
+        "action": "reject"
+      },
+      {
+        "ip_is_private": true,
+        "action": "reject"
       }
     ],
     "rule_set": [
       {
         "type": "remote",
-        "tag": "geosite-cn",
+        "tag": "geosite-category-ads-all",
         "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs",
-        "download_detour": "direct"
-      },
-      {
-        "type": "remote",
-        "tag": "geoip-cn",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
         "download_detour": "direct"
       }
     ],
