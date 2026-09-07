@@ -314,7 +314,7 @@ generate_production_config() {
       },
       "transport": {
         "type": "ws",
-        "path": "/ray",
+        "path": "/175443",
         "max_early_data": 2048,
         "early_data_header_name": "Sec-WebSocket-Protocol"
       }

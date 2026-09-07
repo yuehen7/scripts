@@ -581,7 +581,7 @@ generate_production_config() {
           ]
         },
         "wsSettings": {
-          "path": "/ray"
+          "path": "/175443"
         }
       },
       "sniffing": {
@@ -618,7 +618,7 @@ generate_production_config() {
           ]
         },
         "xhttpSettings": {
-          "path": "/xhttp",
+          "path": "/175443",
           "mode": "packet-up"
         }
       },
