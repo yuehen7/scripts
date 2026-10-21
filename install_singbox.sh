@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
 # sing-box 一键安装、服务管理、BBR 调优、配置生成与节点查看脚本
+# 入站: VLESS-Reality(443) + VMess-WS-TLS(8443)
 # =========================================================
 
 # 颜色配置
@@ -19,6 +20,8 @@ CLI_TARGET="/usr/local/bin/sb"
 SYSCTL_BBR_FILE="/etc/sysctl.d/99-network-bbr.conf"
 LIMITS_FILE="/etc/security/limits.d/99-nofile.conf"
 
+set -o pipefail
+
 # 检查 root 权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请以 root 权限运行此脚本！${PLAIN}" && exit 1
 
@@ -26,19 +29,19 @@ LIMITS_FILE="/etc/security/limits.d/99-nofile.conf"
 install_deps() {
     echo -e "${YELLOW}正在检查并安装基础依赖...${PLAIN}"
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y && apt-get install -y curl wget tar jq systemd
+        apt-get update -y && apt-get install -y curl wget tar jq openssl systemd
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl wget tar jq systemd
+        dnf install -y curl wget tar jq openssl systemd
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl wget tar jq systemd
+        yum install -y curl wget tar jq openssl systemd
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Sy --noconfirm curl wget tar jq systemd
+        pacman -Sy --noconfirm curl wget tar jq openssl systemd
     elif command -v zypper >/dev/null 2>&1; then
-        zypper install -y curl wget tar jq systemd
+        zypper install -y curl wget tar jq openssl systemd
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache curl wget tar jq
+        apk add --no-cache curl wget tar jq openssl
     else
-        echo -e "${YELLOW}未识别的包管理器，请确保已安装 curl, wget, tar, jq${PLAIN}"
+        echo -e "${YELLOW}未识别的包管理器，请确保已安装 curl, wget, tar, jq, openssl${PLAIN}"
     fi
 }
 
@@ -57,6 +60,108 @@ detect_arch() {
             exit 1
             ;;
     esac
+}
+
+# 校验域名格式
+validate_domain() {
+    local domain="$1"
+    [[ ${#domain} -le 253 ]] || return 1
+    [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+# 证书占位处理：缺失时生成自签临时证书，避免 WS-TLS 入站无法启动
+ensure_dummy_cert() {
+    mkdir -p "$CERT_DIR"
+    if [[ -f "${CERT_DIR}/fullchain.pem" && -f "${CERT_DIR}/privkey.pem" ]]; then
+        return 0
+    fi
+    if [[ -f "${CERT_DIR}/fullchain.pem" || -f "${CERT_DIR}/privkey.pem" ]]; then
+        echo -e "${RED}证书目录中只存在证书或私钥其中之一，请补齐后再继续：${CERT_DIR}${PLAIN}"
+        return 1
+    fi
+
+    echo -e "${YELLOW}未检测到证书，正在生成初始临时自签名证书...${PLAIN}"
+    openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+        -keyout "${CERT_DIR}/privkey.pem" \
+        -out "${CERT_DIR}/fullchain.pem" \
+        -subj "/CN=temporary.cert" >/dev/null 2>&1 || {
+            echo -e "${RED}无法生成临时证书，请确认 openssl 可用。${PLAIN}"
+            return 1
+        }
+}
+
+# 校验证书与私钥是否为有效 PEM
+check_certificate_files() {
+    local cert_file="${CERT_DIR}/fullchain.pem"
+    local key_file="${CERT_DIR}/privkey.pem"
+
+    if [[ ! -s "$cert_file" || ! -s "$key_file" ]]; then
+        echo -e "${RED}找不到证书文件。请将证书链保存为 ${cert_file}，私钥保存为 ${key_file}。${PLAIN}"
+        return 1
+    fi
+    if ! openssl x509 -in "$cert_file" -noout >/dev/null 2>&1; then
+        echo -e "${RED}证书文件不是有效的 PEM 证书：${cert_file}${PLAIN}"
+        return 1
+    fi
+    if ! openssl pkey -in "$key_file" -noout >/dev/null 2>&1; then
+        echo -e "${RED}私钥文件不是有效的 PEM 私钥：${key_file}${PLAIN}"
+        return 1
+    fi
+}
+
+# 检查端口是否已被其他进程监听
+check_port_available() {
+    local port="$1"
+    command -v ss >/dev/null 2>&1 || return 0
+
+    local listeners
+    listeners=$(ss -H -ltn 2>/dev/null | awk -v port="$port" '$4 ~ (":" port "$") { print }')
+    if [[ -n "$listeners" ]]; then
+        echo -e "${RED}端口 ${port} 已被其他进程监听，sing-box 无法启动：${PLAIN}"
+        echo "$listeners"
+        return 1
+    fi
+}
+
+# 用本机到候选站点的 TLS 1.3 建连耗时挑选 Reality 伪装目标
+select_reality_target() {
+    local -a candidates=(
+        "www.icloud.com"
+        "xp.apple.com" "vs.aws.amazon.com" "www.xbox.com"
+        "www.oracle.com" "images.nvidia.com" "www.amazon.com" "aws.amazon.com"
+        "www.amd.com" "www.sony.com" "www.tesla.com" "www.intel.com"
+        "www.nvidia.com" "www.apple.com"
+    )
+    local domain elapsed best_domain="" best_elapsed="" milliseconds
+
+    echo -e "${YELLOW}正在检测 Reality 伪装目标的 TLS 1.3 建连延迟...${PLAIN}" >&2
+    for domain in "${candidates[@]}"; do
+        if elapsed=$(curl -4 --noproxy '*' --tlsv1.3 -s -o /dev/null \
+            --connect-timeout 1.5 --max-time 1.5 -w '%{time_appconnect}' "https://${domain}"); then
+            if [[ "$elapsed" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v value="$elapsed" 'BEGIN { exit !(value > 0) }'; then
+                milliseconds=$(awk -v value="$elapsed" 'BEGIN { printf "%.0f", value * 1000 }')
+                echo -e "  ${GREEN}${domain}: ${milliseconds} ms${PLAIN}" >&2
+                if [[ -z "$best_elapsed" ]] || awk -v value="$elapsed" -v best="$best_elapsed" 'BEGIN { exit !(value < best) }'; then
+                    best_domain="$domain"
+                    best_elapsed="$elapsed"
+                fi
+                continue
+            fi
+        fi
+        echo -e "  ${RED}${domain}: timeout${PLAIN}" >&2
+    done
+
+    if [[ -z "$best_domain" ]]; then
+        echo -e "${RED}所有 Reality 候选目标均无法完成 TLS 1.3 握手。${PLAIN}" >&2
+        return 1
+    fi
+
+    milliseconds=$(awk -v value="$best_elapsed" 'BEGIN { printf "%.0f", value * 1000 }')
+    echo -e "${GREEN}已选择 Reality 目标: ${best_domain}:443 (${milliseconds} ms)${PLAIN}" >&2
+    if [[ "$best_domain" == *apple.com || "$best_domain" == "www.icloud.com" ]]; then
+        echo -e "${YELLOW}提示: 使用 Apple/iCloud 作为伪装目标可能带来 IP 封锁风险。${PLAIN}" >&2
+    fi
+    printf '%s\n' "$best_domain"
 }
 
 # BBR 与网络栈调优
@@ -132,9 +237,19 @@ download_singbox() {
 
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    curl -L -o "${tmp_dir}/${filename}" "$url"
+    if ! curl -L -f -o "${tmp_dir}/${filename}" "$url"; then
+        echo -e "${RED}下载 sing-box 失败，请检查网络！${PLAIN}"
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
 
-    tar -xzf "${tmp_dir}/${filename}" -C "$tmp_dir"
+    if ! tar -xzf "${tmp_dir}/${filename}" -C "$tmp_dir" \
+        || [[ ! -f "${tmp_dir}/sing-box-${version}-${ARCH}/sing-box" ]]; then
+        echo -e "${RED}安装包无效或不包含 sing-box 可执行文件。${PLAIN}"
+        rm -rf "$tmp_dir"
+        exit 1
+    fi
+
     mv "${tmp_dir}/sing-box-${version}-${ARCH}/sing-box" "${INSTALL_DIR}/sing-box"
     chmod +x "${INSTALL_DIR}/sing-box"
     rm -rf "$tmp_dir"
@@ -159,7 +274,7 @@ view_inbound_info() {
     
     # 解析 WS-TLS 入站
     local ws_tag
-    ws_tag=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+    ws_tag=$(jq -r '.inbounds[] | select(.tag=="vmess-ws-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
 
     echo -e "\n${CYAN}================================================================${PLAIN}"
     echo -e "${CYAN}                     当前入站节点配置详情                       ${PLAIN}"
@@ -174,11 +289,10 @@ view_inbound_info() {
         r_pri=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tls.reality.private_key' "$CONFIG_FILE")
         r_sid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tls.reality.short_id[0]' "$CONFIG_FILE")
         
-        # 尝试通过私钥推导公钥，若失败尝试从配置备注/本地提取
-        r_pub=$(${INSTALL_DIR}/sing-box generate reality-keypair 2>/dev/null | grep -i "PublicKey:" | awk '{print $2}' || true)
-        # 如果 sing-box generate 只能生成成对密钥，我们改用已知匹配或在生成时留存
-        if [[ -f "${CONFIG_DIR}/reality_pub.key" ]]; then
-            r_pub=$(cat "${CONFIG_DIR}/reality_pub.key")
+        # sing-box 没有“由私钥推导公钥”的命令，只能依赖生成配置时留存的公钥文件
+        r_pub=""
+        if [[ -s "${CONFIG_DIR}/reality_pub.key" ]]; then
+            r_pub=$(tr -d '[:space:]' < "${CONFIG_DIR}/reality_pub.key")
         fi
 
         echo -e "${GREEN}【协议 1: VLESS + Reality (直连推荐)】${PLAIN}"
@@ -196,30 +310,76 @@ view_inbound_info() {
             local r_link="vless://${r_uuid}@${server_ip}:${r_port}?security=reality&encryption=none&pbk=${r_pub}&headerType=none&type=tcp&flow=${r_flow}&sni=${r_sni}&sid=${r_sid}#VLESS-Reality"
             echo -e "  分享链接 (Link):"
             echo -e "  ${YELLOW}${r_link}${PLAIN}"
+        else
+            echo -e "  ${YELLOW}未找到公钥记录 (${CONFIG_DIR}/reality_pub.key)，无法生成分享链接；"
+            echo -e "  可执行 'sb gen' 重新生成配置，或手动补写该文件后重试。${PLAIN}"
         fi
         echo -e "----------------------------------------------------------------"
     fi
 
     if [[ -n "$ws_tag" ]]; then
         local ws_port ws_uuid ws_sni ws_path
-        ws_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .listen_port' "$CONFIG_FILE")
-        ws_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .users[0].uuid' "$CONFIG_FILE")
-        ws_sni=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .tls.server_name' "$CONFIG_FILE")
-        ws_path=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .transport.path' "$CONFIG_FILE")
+        ws_port=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .listen_port' "$CONFIG_FILE")
+        ws_uuid=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$CONFIG_FILE")
+        ws_sni=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .tls.server_name' "$CONFIG_FILE")
+        ws_path=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .transport.path' "$CONFIG_FILE")
 
-        echo -e "${GREEN}【协议 2: VLESS + WS + TLS (支持 CDN/Cloudflare)】${PLAIN}"
+        echo -e "${GREEN}【协议 2: VMess + WS + TLS (支持 CDN 回源)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${ws_sni} (或填服务器 IP / CDN 优选 IP)${PLAIN}"
         echo -e "  端口 (Port):        ${CYAN}${ws_port}${PLAIN}"
         echo -e "  用户 ID (UUID):     ${CYAN}${ws_uuid}${PLAIN}"
-        echo -e "  加密 (Encryption):  ${CYAN}none${PLAIN}"
+        echo -e "  加密方式 (Cipher):  ${CYAN}auto${PLAIN}"
         echo -e "  传输协议 (Network): ${CYAN}ws${PLAIN}"
         echo -e "  传输安全 (Security):${CYAN}tls${PLAIN}"
         echo -e "  伪装域名 (SNI/Host):${CYAN}${ws_sni}${PLAIN}"
         echo -e "  路径 (Path):        ${CYAN}${ws_path}${PLAIN}"
-        
-        local ws_link="vless://${ws_uuid}@${ws_sni}:${ws_port}?security=tls&encryption=none&type=ws&host=${ws_sni}&path=${ws_path}#VLESS-WS-TLS"
+
+        # vmess:// 分享链接 = base64(标准 vmess 节点 JSON)
+        local ws_vmess_json ws_link
+        ws_vmess_json=$(jq -cn \
+            --arg ps "sing-box-VMess-WS-TLS" \
+            --arg add "$ws_sni" \
+            --argjson port "$ws_port" \
+            --arg id "$ws_uuid" \
+            --arg host "$ws_sni" \
+            --arg path "$ws_path" \
+            --arg alpn "http/1.1" \
+            '{v: "2", ps: $ps, add: $add, port: ($port | tostring), id: $id, aid: "0",
+              scy: "auto", net: "ws", type: "none", host: $host, path: $path,
+              tls: "tls", sni: $host, alpn: $alpn, fp: "chrome"}')
+        ws_link="vmess://$(printf '%s' "$ws_vmess_json" | base64 | tr -d '\n')"
         echo -e "  分享链接 (Link):"
         echo -e "  ${YELLOW}${ws_link}${PLAIN}"
+        echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
+        jq -n \
+            --arg name "sing-box-VMess-WS-TLS" \
+            --arg server "$ws_sni" \
+            --argjson port "$ws_port" \
+            --arg id "$ws_uuid" \
+            --arg host "$ws_sni" \
+            --arg path "$ws_path" \
+            '{
+              name: $name,
+              type: "vmess",
+              server: $server,
+              port: $port,
+              uuid: $id,
+              alterId: 0,
+              cipher: "auto",
+              udp: true,
+              tls: true,
+              servername: $host,
+              "client-fingerprint": "chrome",
+              network: "ws",
+              "ws-opts": {
+                path: $path,
+                headers: { Host: $host }
+              }
+            }'
+        echo -e "----------------------------------------------------------------"
+    else
+        echo -e "${YELLOW}【协议 2】未找到 VMess-WS-TLS 入站 (tag: vmess-ws-tls-in)。${PLAIN}"
+        echo -e "${YELLOW}  旧配置仍是 vless-ws-tls-in，请执行 'sb gen' 重新生成配置。${PLAIN}"
         echo -e "----------------------------------------------------------------"
     fi
 
@@ -233,6 +393,7 @@ view_inbound_info() {
 generate_production_config() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$CERT_DIR"
+    ensure_dummy_cert || return 1
 
     echo -e "\n${CYAN}=================================================${PLAIN}"
     echo -e "${CYAN}      sing-box 节点配置生成器 (Dual-Inbound)       ${PLAIN}"
@@ -240,26 +401,49 @@ generate_production_config() {
 
     local ws_domain=""
     while [[ -z "$ws_domain" ]]; do
-        read -rp "请输入 vless-ws-tls-in 绑定的域名 (例如: node.yourdomain.com): " ws_domain </dev/tty
+        read -rp "请输入 VMess-WS-TLS 入站绑定的域名 (例如: node.yourdomain.com): " ws_domain </dev/tty
         ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
+        ws_domain=${ws_domain%.}
+        ws_domain=${ws_domain,,}
+        if ! validate_domain "$ws_domain"; then
+            echo -e "${RED}域名格式无效，请输入完整的域名，例如 node.example.com。${PLAIN}"
+            ws_domain=""
+        fi
     done
+
+    local reality_domain
+    reality_domain=$(select_reality_target) || {
+        echo -e "${RED}无法选择 Reality 伪装目标，未写入新配置。请检查服务器的 IPv4 出站网络后重试。${PLAIN}"
+        return 1
+    }
 
     echo -e "${YELLOW}正在自动生成 UUID、Reality 密钥对与 Short-ID...${PLAIN}"
     local uuid
-    uuid=$(${INSTALL_DIR}/sing-box generate uuid)
+    uuid=$(${INSTALL_DIR}/sing-box generate uuid) || {
+        echo -e "${RED}无法生成 UUID。${PLAIN}"
+        return 1
+    }
     
     local keypair
-    keypair=$(${INSTALL_DIR}/sing-box generate reality-keypair)
+    keypair=$(${INSTALL_DIR}/sing-box generate reality-keypair) || {
+        echo -e "${RED}无法生成 Reality 密钥对。${PLAIN}"
+        return 1
+    }
     local private_key
-    private_key=$(echo "$keypair" | grep -i "PrivateKey:" | awk '{print $2}')
+    private_key=$(echo "$keypair" | grep -iE 'Private[[:space:]]*key' | awk '{print $2}' | tr -d '[:space:]')
     local public_key
-    public_key=$(echo "$keypair" | grep -i "PublicKey:" | awk '{print $2}')
+    public_key=$(echo "$keypair" | grep -iE 'Public[[:space:]]*key' | awk '{print $2}' | tr -d '[:space:]')
+
+    if [[ -z "$private_key" || -z "$public_key" ]]; then
+        echo -e "${RED}无法解析 Reality 密钥对，sing-box 版本可能不兼容。${PLAIN}"
+        return 1
+    fi
     
     # 将生成的公钥留存一份备查
     echo "$public_key" > "${CONFIG_DIR}/reality_pub.key"
 
     local short_id
-    short_id=$(${INSTALL_DIR}/sing-box generate rand --hex 8)
+    short_id=$(openssl rand -hex 8 2>/dev/null || ${INSTALL_DIR}/sing-box generate rand --hex 8)
 
     cat << EOF > "$CONFIG_FILE"
 {
@@ -282,11 +466,11 @@ generate_production_config() {
       ],
       "tls": {
         "enabled": true,
-        "server_name": "www.apple.com",
+        "server_name": "${reality_domain}",
         "reality": {
           "enabled": true,
           "handshake": {
-            "server": "www.apple.com",
+            "server": "${reality_domain}",
             "server_port": 443
           },
           "private_key": "${private_key}",
@@ -297,13 +481,14 @@ generate_production_config() {
       }
     },
     {
-      "type": "vless",
-      "tag": "vless-ws-tls-in",
+      "type": "vmess",
+      "tag": "vmess-ws-tls-in",
       "listen": "::",
       "listen_port": 8443,
       "users": [
         {
-          "uuid": "${uuid}"
+          "uuid": "${uuid}",
+          "alterId": 0
         }
       ],
       "tls": {
@@ -375,30 +560,46 @@ Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
 
 [Service]
+User=root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
+ExecStartPre=${INSTALL_DIR}/sing-box check -c ${CONFIG_FILE}
 ExecStart=${INSTALL_DIR}/sing-box run -c ${CONFIG_FILE}
 Restart=on-failure
 RestartSec=10s
-LimitNOFILE=infinity
+LimitNPROC=10000
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable sing-box >/dev/null 2>&1
+    if ! systemctl enable sing-box >/dev/null 2>&1; then
+        echo -e "${RED}设置开机自启失败，请手动执行 systemctl enable sing-box 排查。${PLAIN}"
+        return 1
+    fi
     echo -e "${GREEN}Systemd 系统服务已注册。${PLAIN}"
+}
+
+# 启动失败时输出最近日志与排查建议
+show_start_failure() {
+    echo -e "${RED}sing-box 启动失败。以下是最近的 systemd 日志：${PLAIN}"
+    journalctl -u sing-box --no-pager -n 40 -o cat 2>/dev/null || true
+    echo -e "${YELLOW}可依次执行：sb test、ss -ltnp | grep -E ':(443|8443)'、sb log 进行排查。${PLAIN}"
 }
 
 # 服务控制函数
 start_service() {
-    if [[ ! -f "${CERT_DIR}/fullchain.pem" || ! -f "${CERT_DIR}/privkey.pem" ]]; then
-        echo -e "${YELLOW}提示: 未检测到证书文件 (${CERT_DIR}/fullchain.pem)，若 WS-TLS 启用可能无法正常工作。${PLAIN}"
+    test_config || return 1
+    if systemctl start sing-box; then
+        echo -e "${GREEN}sing-box 服务已启动。${PLAIN}"
+        check_status
+    else
+        show_start_failure
+        return 1
     fi
-    systemctl start sing-box
-    echo -e "${GREEN}sing-box 服务已启动。${PLAIN}"
-    check_status
 }
 
 stop_service() {
@@ -407,9 +608,14 @@ stop_service() {
 }
 
 restart_service() {
-    systemctl restart sing-box
-    echo -e "${GREEN}sing-box 已重启。${PLAIN}"
-    check_status
+    test_config || return 1
+    if systemctl restart sing-box; then
+        echo -e "${GREEN}sing-box 已重启。${PLAIN}"
+        check_status
+    else
+        show_start_failure
+        return 1
+    fi
 }
 
 check_status() {
@@ -417,6 +623,7 @@ check_status() {
         echo -e "运行状态: ${GREEN}运行中 (Active)${PLAIN}"
     else
         echo -e "运行状态: ${RED}未运行 (Inactive)${PLAIN}"
+        echo -e "${YELLOW}提示: 若启动失败，可运行 'sb test' 查看具体配置报错信息。${PLAIN}"
     fi
 }
 
@@ -425,6 +632,16 @@ view_logs() {
 }
 
 test_config() {
+    if [[ ! -x "${INSTALL_DIR}/sing-box" ]]; then
+        echo -e "${RED}未找到 sing-box 可执行文件：${INSTALL_DIR}/sing-box${PLAIN}"
+        return 1
+    fi
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}未找到配置文件：${CONFIG_FILE}${PLAIN}"
+        return 1
+    fi
+    check_certificate_files || return 1
+    echo -e "${YELLOW}正在检查 sing-box 配置...${PLAIN}"
     ${INSTALL_DIR}/sing-box check -c "$CONFIG_FILE"
 }
 
@@ -446,6 +663,10 @@ update_core() {
     echo -e "${YELLOW}正在检测最新版本...${PLAIN}"
     local tag
     tag=$(curl -sL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name')
+    if [[ -z "$tag" || "$tag" == "null" ]]; then
+        echo -e "${RED}获取最新版本失败，请检查网络或 GitHub API 频率限制！${PLAIN}"
+        return 1
+    fi
     local cur_ver
     cur_ver=$(${INSTALL_DIR}/sing-box version 2>/dev/null | awk 'NR==1{print $3}')
     
@@ -458,16 +679,34 @@ update_core() {
     local version="${tag#v}"
     local filename="sing-box-${version}-${ARCH}.tar.gz"
     local url="https://github.com/SagerNet/sing-box/releases/download/${tag}/${filename}"
-    
+
     local tmp_dir
     tmp_dir=$(mktemp -d)
-    curl -L -o "${tmp_dir}/${filename}" "$url"
-    tar -xzf "${tmp_dir}/${filename}" -C "$tmp_dir"
+    if ! curl -L -f -o "${tmp_dir}/${filename}" "$url"; then
+        echo -e "${RED}下载新版本失败，已保留当前版本 ${cur_ver}。${PLAIN}"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if ! tar -xzf "${tmp_dir}/${filename}" -C "$tmp_dir" \
+        || [[ ! -f "${tmp_dir}/sing-box-${version}-${ARCH}/sing-box" ]]; then
+        echo -e "${RED}安装包无效，已保留当前版本 ${cur_ver}。${PLAIN}"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    if ! "${tmp_dir}/sing-box-${version}-${ARCH}/sing-box" version >/dev/null 2>&1; then
+        echo -e "${RED}新版本二进制无法运行，已保留当前版本 ${cur_ver}。${PLAIN}"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+
     systemctl stop sing-box
     mv "${tmp_dir}/sing-box-${version}-${ARCH}/sing-box" "${INSTALL_DIR}/sing-box"
     chmod +x "${INSTALL_DIR}/sing-box"
     rm -rf "$tmp_dir"
-    systemctl start sing-box
+    if ! systemctl start sing-box; then
+        show_start_failure
+        return 1
+    fi
     echo -e "${GREEN}更新成功，当前版本: $(${INSTALL_DIR}/sing-box version | awk 'NR==1{print $3}')${PLAIN}"
 }
 
@@ -511,8 +750,15 @@ uninstall_all() {
 
 # 部署全局 sb 命令
 install_cli() {
-    curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_singbox.sh -o "$CLI_TARGET"
-    chmod +x "$CLI_TARGET"
+    if [[ -f "$0" && -r "$0" ]]; then
+        cp "$0" "$CLI_TARGET"
+    else
+        curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_singbox.sh -o "$CLI_TARGET" || {
+            echo -e "${RED}无法安装 sb 快捷命令，请稍后重试。${PLAIN}"
+            return 1
+        }
+    fi
+    chmod 0755 "$CLI_TARGET"
     echo -e "${GREEN}快捷命令 'sb' 部署完成。${PLAIN}"
 }
 
@@ -563,25 +809,30 @@ main() {
         status) check_status ;;
         log) view_logs ;;
         info) view_inbound_info ;;
-        check) test_config ;;
+        check|test) test_config ;;
         edit) edit_config ;;
         gen) generate_production_config ;;
         update) update_core ;;
         bbr) manage_bbr ;;
         uninstall) uninstall_all ;;
         menu) show_menu ;;
-        *)
-            if [[ "$0" == *"/sb" ]]; then
+        "")
+            if [[ "$0" == *"/sb" || "$0" == "sb" ]]; then
                 show_menu
             else
                 install_deps
                 apply_bbr_and_optimization
                 download_singbox
-                generate_production_config
+                generate_production_config || exit 1
                 setup_service
                 install_cli
 
-                systemctl start sing-box >/dev/null 2>&1 || true
+                check_port_available 443 || exit 1
+                check_port_available 8443 || exit 1
+                if ! start_service; then
+                    echo -e "${RED}安装完成，但 sing-box 未能启动；请按上方日志修复后执行 sb start。${PLAIN}"
+                    exit 1
+                fi
 
                 echo -e "\n${GREEN}=================================================${PLAIN}"
                 echo -e " 安装完成！"
@@ -589,8 +840,13 @@ main() {
                 echo -e " 证书目录: ${CERT_DIR}/"
                 echo -e " 查看节点信息: ${YELLOW}sb info${PLAIN}"
                 echo -e " 全局管理工具: ${YELLOW}sb${PLAIN}"
+                echo -e " 默认仅生成临时自签证书，请替换为正式证书后再对外提供服务。"
                 echo -e "${GREEN}=================================================${PLAIN}"
             fi
+            ;;
+        *)
+            echo -e "${RED}未知子命令: $1${PLAIN}"
+            show_menu
             ;;
     esac
 }
