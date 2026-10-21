@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
 # Xray (v26.6.27) 一键安装、服务管理、BBR 调优与配置生成脚本
+# 入站: VLESS-Reality(443) + VMess-WS-TLS(8443) + VMess-XHTTP-TLS(2053)
 # =========================================================
 
 # 颜色配置
@@ -253,8 +254,13 @@ view_inbound_info() {
 
     local r_tag ws_tag xhttp_tag
     r_tag=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
-    ws_tag=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
-    xhttp_tag=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+    ws_tag=$(jq -r '.inbounds[] | select(.tag=="vmess-ws-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+    xhttp_tag=$(jq -r '.inbounds[] | select(.tag=="vmess-xhttp-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+
+    if [[ -z "$ws_tag" || -z "$xhttp_tag" ]]; then
+        echo -e "${YELLOW}提示: 未找到 VMess 入站 (vmess-ws-tls-in / vmess-xhttp-tls-in)。${PLAIN}"
+        echo -e "${YELLOW}      若为旧版 VLESS 配置，请执行 'xr gen' 重新生成，或手动修改这两个入站的 protocol。${PLAIN}"
+    fi
 
     echo -e "\n${CYAN}================================================================${PLAIN}"
     echo -e "${CYAN}                     当前 Xray 入站节点配置详情                 ${PLAIN}"
@@ -326,30 +332,43 @@ view_inbound_info() {
     fi
 
     if [[ -n "$ws_tag" ]]; then
-        local ws_port ws_uuid ws_sni ws_path ws_alpn ws_path_uri ws_alpn_uri
-        ws_port=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .port' "$CONFIG_FILE")
-        ws_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .settings.clients[0].id' "$CONFIG_FILE")
-        ws_sni=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
-        ws_path=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | .streamSettings.wsSettings.path' "$CONFIG_FILE")
-        ws_alpn=$(jq -r '.inbounds[] | select(.tag=="vless-ws-tls-in") | (.streamSettings.tlsSettings.alpn[0] // "http/1.1")' "$CONFIG_FILE")
-        ws_path_uri=${ws_path//\//%2F}
-        ws_alpn_uri=${ws_alpn//\//%2F}
+        local ws_port ws_uuid ws_sni ws_path ws_alpn
+        ws_port=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .port' "$CONFIG_FILE")
+        ws_uuid=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .settings.clients[0].id' "$CONFIG_FILE")
+        ws_sni=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
+        ws_path=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.wsSettings.path' "$CONFIG_FILE")
+        ws_alpn=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | (.streamSettings.tlsSettings.alpn[0] // "http/1.1")' "$CONFIG_FILE")
 
-        echo -e "${GREEN}【协议 2: VLESS + WS + TLS (支持 CDN 回源)】${PLAIN}"
+        echo -e "${GREEN}【协议 2: VMess + WS + TLS (支持 CDN 回源)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${ws_sni} (或填服务器IP/CDN优选IP)${PLAIN}"
         echo -e "  端口 (Port):        ${CYAN}${ws_port}${PLAIN}"
         echo -e "  用户 ID (UUID):     ${CYAN}${ws_uuid}${PLAIN}"
+        echo -e "  加密方式 (Cipher):  ${CYAN}auto${PLAIN}"
         echo -e "  传输协议 (Network): ws"
         echo -e "  传输安全 (Security):tls"
         echo -e "  伪装域名 (SNI/Host):${CYAN}${ws_sni}${PLAIN}"
         echo -e "  路径 (Path):        ${CYAN}${ws_path}${PLAIN}"
 
-        local ws_link="vless://${ws_uuid}@${ws_sni}:${ws_port}?encryption=none&security=tls&sni=${ws_sni}&fp=chrome&alpn=${ws_alpn_uri}&insecure=0&allowInsecure=0&type=ws&host=${ws_sni}&path=${ws_path_uri}#Xray-WS-TLS"
+        # vmess:// 分享链接 = base64(标准 vmess 节点 JSON)
+        local ws_vmess_json ws_link
+        ws_vmess_json=$(jq -cn \
+            --arg ps "Xray-VMess-WS-TLS" \
+            --arg add "$ws_sni" \
+            --argjson port "$ws_port" \
+            --arg id "$ws_uuid" \
+            --arg host "$ws_sni" \
+            --arg path "$ws_path" \
+            --arg sni "$ws_sni" \
+            --arg alpn "$ws_alpn" \
+            '{v: "2", ps: $ps, add: $add, port: ($port | tostring), id: $id, aid: "0",
+              scy: "auto", net: "ws", type: "none", host: $host, path: $path,
+              tls: "tls", sni: $sni, alpn: $alpn, fp: "chrome"}')
+        ws_link="vmess://$(printf '%s' "$ws_vmess_json" | base64 | tr -d '\n')"
         echo -e "  分享链接 (Link):"
         echo -e "  ${YELLOW}${ws_link}${PLAIN}"
         echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
         jq -n \
-            --arg name "Xray-WS-TLS" \
+            --arg name "Xray-VMess-WS-TLS" \
             --arg server "$ws_sni" \
             --argjson port "$ws_port" \
             --arg uuid "$ws_uuid" \
@@ -358,12 +377,13 @@ view_inbound_info() {
             --arg path "$ws_path" \
             '{
               name: $name,
-              type: "vless",
+              type: "vmess",
               server: $server,
               port: $port,
               udp: true,
               uuid: $uuid,
-              encryption: "",
+              alterId: 0,
+              cipher: "auto",
               tls: true,
               servername: $sni,
               alpn: [$alpn],
@@ -381,31 +401,46 @@ view_inbound_info() {
     fi
 
     if [[ -n "$xhttp_tag" ]]; then
-        local xhttp_port xhttp_uuid xhttp_sni xhttp_path xhttp_alpn xhttp_mode xhttp_path_uri
-        xhttp_port=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .port' "$CONFIG_FILE")
-        xhttp_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .settings.clients[0].id' "$CONFIG_FILE")
-        xhttp_sni=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
-        xhttp_path=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | .streamSettings.xhttpSettings.path' "$CONFIG_FILE")
-        xhttp_alpn=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | (.streamSettings.tlsSettings.alpn[0] // "h2")' "$CONFIG_FILE")
-        xhttp_mode=$(jq -r '.inbounds[] | select(.tag=="vless-xhttp-tls-in") | (.streamSettings.xhttpSettings.mode // "packet-up")' "$CONFIG_FILE")
-        xhttp_path_uri=${xhttp_path//\//%2F}
+        local xhttp_port xhttp_uuid xhttp_sni xhttp_path xhttp_alpn xhttp_mode
+        xhttp_port=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | .port' "$CONFIG_FILE")
+        xhttp_uuid=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | .settings.clients[0].id' "$CONFIG_FILE")
+        xhttp_sni=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
+        xhttp_path=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.xhttpSettings.path' "$CONFIG_FILE")
+        xhttp_alpn=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | (.streamSettings.tlsSettings.alpn[0] // "h2")' "$CONFIG_FILE")
+        xhttp_mode=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | (.streamSettings.xhttpSettings.mode // "packet-up")' "$CONFIG_FILE")
 
-        echo -e "${GREEN}【协议 3: VLESS + XHTTP + TLS (CDN 备用)】${PLAIN}"
+        echo -e "${GREEN}【协议 3: VMess + XHTTP + TLS (CDN 备用)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${xhttp_sni} (或填服务器IP/CDN优选IP)${PLAIN}"
         echo -e "  端口 (Port):        ${CYAN}${xhttp_port}${PLAIN}"
         echo -e "  用户 ID (UUID):     ${CYAN}${xhttp_uuid}${PLAIN}"
+        echo -e "  加密方式 (Cipher):  ${CYAN}auto${PLAIN}"
         echo -e "  传输协议 (Network): xhttp"
         echo -e "  传输模式 (Mode):    ${CYAN}${xhttp_mode}${PLAIN}"
         echo -e "  传输安全 (Security):tls"
         echo -e "  伪装域名 (SNI/Host):${CYAN}${xhttp_sni}${PLAIN}"
         echo -e "  路径 (Path):        ${CYAN}${xhttp_path}${PLAIN}"
 
-        local xhttp_link="vless://${xhttp_uuid}@${xhttp_sni}:${xhttp_port}?encryption=none&security=tls&sni=${xhttp_sni}&fp=chrome&alpn=${xhttp_alpn}&insecure=0&allowInsecure=0&type=xhttp&host=${xhttp_sni}&path=${xhttp_path_uri}&mode=${xhttp_mode}#Xray-XHTTP-TLS"
+        # vmess:// 分享链接 = base64(标准 vmess 节点 JSON)
+        local xhttp_vmess_json xhttp_link
+        xhttp_vmess_json=$(jq -cn \
+            --arg ps "Xray-VMess-XHTTP-TLS" \
+            --arg add "$xhttp_sni" \
+            --argjson port "$xhttp_port" \
+            --arg id "$xhttp_uuid" \
+            --arg host "$xhttp_sni" \
+            --arg path "$xhttp_path" \
+            --arg sni "$xhttp_sni" \
+            --arg alpn "$xhttp_alpn" \
+            --arg mode "$xhttp_mode" \
+            '{v: "2", ps: $ps, add: $add, port: ($port | tostring), id: $id, aid: "0",
+              scy: "auto", net: "xhttp", type: "none", host: $host, path: $path,
+              tls: "tls", sni: $sni, alpn: $alpn, fp: "chrome", mode: $mode}')
+        xhttp_link="vmess://$(printf '%s' "$xhttp_vmess_json" | base64 | tr -d '\n')"
         echo -e "  分享链接 (Link):"
         echo -e "  ${YELLOW}${xhttp_link}${PLAIN}"
         echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
         jq -n \
-            --arg name "Xray-XHTTP-TLS" \
+            --arg name "Xray-VMess-XHTTP-TLS" \
             --arg server "$xhttp_sni" \
             --argjson port "$xhttp_port" \
             --arg uuid "$xhttp_uuid" \
@@ -415,12 +450,13 @@ view_inbound_info() {
             --arg mode "$xhttp_mode" \
             '{
               name: $name,
-              type: "vless",
+              type: "vmess",
               server: $server,
               port: $port,
               udp: true,
               uuid: $uuid,
-              encryption: "",
+              alterId: 0,
+              cipher: "auto",
               tls: true,
               servername: $sni,
               alpn: [$alpn],
@@ -454,7 +490,7 @@ generate_production_config() {
 
     local ws_domain=""
     while [[ -z "$ws_domain" ]]; do
-        read -rp "请输入 vless-ws-tls-in 绑定的域名: " ws_domain </dev/tty
+        read -rp "请输入 VMess (WS/XHTTP) 入站绑定的域名: " ws_domain </dev/tty
         ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
         ws_domain=${ws_domain%.}
         ws_domain=${ws_domain,,}
@@ -553,17 +589,16 @@ generate_production_config() {
       }
     },
     {
-      "tag": "vless-ws-tls-in",
+      "tag": "vmess-ws-tls-in",
       "port": 8443,
       "listen": "0.0.0.0",
-      "protocol": "vless",
+      "protocol": "vmess",
       "settings": {
         "clients": [
           {
             "id": "${uuid}"
           }
-        ],
-        "decryption": "none"
+        ]
       },
       "streamSettings": {
         "network": "ws",
@@ -590,17 +625,16 @@ generate_production_config() {
       }
     },
     {
-      "tag": "vless-xhttp-tls-in",
+      "tag": "vmess-xhttp-tls-in",
       "port": 2053,
       "listen": "0.0.0.0",
-      "protocol": "vless",
+      "protocol": "vmess",
       "settings": {
         "clients": [
           {
             "id": "${uuid}"
           }
-        ],
-        "decryption": "none"
+        ]
       },
       "streamSettings": {
         "network": "xhttp",
