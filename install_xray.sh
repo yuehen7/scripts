@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
 # Xray (v26.6.27) 一键安装、服务管理、BBR 调优与配置生成脚本
-# 入站: VLESS-Reality(443) + VMess-WS-TLS(8443) + VMess-XHTTP-TLS(2053)
+# 入站: VLESS-Reality(443) + VMess-WS-TLS(8443) + VMess-gRPC-TLS(2053)
 # =========================================================
 
 # 颜色配置
@@ -252,14 +252,19 @@ view_inbound_info() {
     local server_ip
     server_ip=$(curl -s4m 6 https://api.ipify.org || curl -s4m 6 https://ip.sb || echo "YOUR_SERVER_IP")
 
-    local r_tag ws_tag xhttp_tag
+    local r_tag ws_tag grpc_tag
     r_tag=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
     ws_tag=$(jq -r '.inbounds[] | select(.tag=="vmess-ws-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
-    xhttp_tag=$(jq -r '.inbounds[] | select(.tag=="vmess-xhttp-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+    grpc_tag=$(jq -r '.inbounds[] | select(.tag=="vmess-grpc-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
 
-    if [[ -z "$ws_tag" || -z "$xhttp_tag" ]]; then
-        echo -e "${YELLOW}提示: 未找到 VMess 入站 (vmess-ws-tls-in / vmess-xhttp-tls-in)。${PLAIN}"
-        echo -e "${YELLOW}      若为旧版 VLESS 配置，请执行 'xr gen' 重新生成，或手动修改这两个入站的 protocol。${PLAIN}"
+    if [[ -z "$grpc_tag" ]] && jq -e '[.inbounds[] | select(.tag=="vmess-xhttp-tls-in")] | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${YELLOW}提示: 检测到旧版 XHTTP 入站 (vmess-xhttp-tls-in)，本脚本已改用 gRPC。${PLAIN}"
+        echo -e "${YELLOW}      执行 'xr gen' 可重新生成 VMess-gRPC-TLS 配置 (端口 2053 保持不变)。${PLAIN}"
+    fi
+
+    if [[ -z "$ws_tag" || -z "$grpc_tag" ]]; then
+        echo -e "${YELLOW}提示: 未找到 VMess 入站 (vmess-ws-tls-in / vmess-grpc-tls-in)。${PLAIN}"
+        echo -e "${YELLOW}      若为旧版配置，请执行 'xr gen' 重新生成。${PLAIN}"
     fi
 
     echo -e "\n${CYAN}================================================================${PLAIN}"
@@ -400,54 +405,51 @@ view_inbound_info() {
         echo -e "----------------------------------------------------------------"
     fi
 
-    if [[ -n "$xhttp_tag" ]]; then
-        local xhttp_port xhttp_uuid xhttp_sni xhttp_path xhttp_alpn xhttp_mode
-        xhttp_port=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | .port' "$CONFIG_FILE")
-        xhttp_uuid=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | .settings.clients[0].id' "$CONFIG_FILE")
-        xhttp_sni=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
-        xhttp_path=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.xhttpSettings.path' "$CONFIG_FILE")
-        xhttp_alpn=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | (.streamSettings.tlsSettings.alpn[0] // "h2")' "$CONFIG_FILE")
-        xhttp_mode=$(jq -r --arg t "$xhttp_tag" '.inbounds[] | select(.tag==$t) | (.streamSettings.xhttpSettings.mode // "packet-up")' "$CONFIG_FILE")
+    if [[ -n "$grpc_tag" ]]; then
+        local grpc_port grpc_uuid grpc_sni grpc_service grpc_alpn
+        grpc_port=$(jq -r --arg t "$grpc_tag" '.inbounds[] | select(.tag==$t) | .port' "$CONFIG_FILE")
+        grpc_uuid=$(jq -r --arg t "$grpc_tag" '.inbounds[] | select(.tag==$t) | .settings.clients[0].id' "$CONFIG_FILE")
+        grpc_sni=$(jq -r --arg t "$grpc_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
+        grpc_service=$(jq -r --arg t "$grpc_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.grpcSettings.serviceName' "$CONFIG_FILE")
+        grpc_alpn=$(jq -r --arg t "$grpc_tag" '.inbounds[] | select(.tag==$t) | (.streamSettings.tlsSettings.alpn[0] // "h2")' "$CONFIG_FILE")
 
-        echo -e "${GREEN}【协议 3: VMess + XHTTP + TLS (CDN 备用)】${PLAIN}"
-        echo -e "  地址 (Address):     ${CYAN}${xhttp_sni} (或填服务器IP/CDN优选IP)${PLAIN}"
-        echo -e "  端口 (Port):        ${CYAN}${xhttp_port}${PLAIN}"
-        echo -e "  用户 ID (UUID):     ${CYAN}${xhttp_uuid}${PLAIN}"
+        echo -e "${GREEN}【协议 3: VMess + gRPC + TLS (CDN 备用)】${PLAIN}"
+        echo -e "  地址 (Address):     ${CYAN}${grpc_sni} (或填服务器IP/CDN优选IP)${PLAIN}"
+        echo -e "  端口 (Port):        ${CYAN}${grpc_port}${PLAIN}"
+        echo -e "  用户 ID (UUID):     ${CYAN}${grpc_uuid}${PLAIN}"
         echo -e "  加密方式 (Cipher):  ${CYAN}auto${PLAIN}"
-        echo -e "  传输协议 (Network): xhttp"
-        echo -e "  传输模式 (Mode):    ${CYAN}${xhttp_mode}${PLAIN}"
+        echo -e "  传输协议 (Network): grpc"
         echo -e "  传输安全 (Security):tls"
-        echo -e "  伪装域名 (SNI/Host):${CYAN}${xhttp_sni}${PLAIN}"
-        echo -e "  路径 (Path):        ${CYAN}${xhttp_path}${PLAIN}"
+        echo -e "  伪装域名 (SNI/Host):${CYAN}${grpc_sni}${PLAIN}"
+        echo -e "  服务名 (ServiceName):${CYAN}${grpc_service}${PLAIN}"
 
         # vmess:// 分享链接 = base64(标准 vmess 节点 JSON)
-        local xhttp_vmess_json xhttp_link
-        xhttp_vmess_json=$(jq -cn \
-            --arg ps "Xray-VMess-XHTTP-TLS" \
-            --arg add "$xhttp_sni" \
-            --argjson port "$xhttp_port" \
-            --arg id "$xhttp_uuid" \
-            --arg host "$xhttp_sni" \
-            --arg path "$xhttp_path" \
-            --arg sni "$xhttp_sni" \
-            --arg alpn "$xhttp_alpn" \
-            --arg mode "$xhttp_mode" \
+        # gRPC 的 serviceName 在分享链接中填入 path 字段
+        local grpc_vmess_json grpc_link
+        grpc_vmess_json=$(jq -cn \
+            --arg ps "Xray-VMess-gRPC-TLS" \
+            --arg add "$grpc_sni" \
+            --argjson port "$grpc_port" \
+            --arg id "$grpc_uuid" \
+            --arg host "$grpc_sni" \
+            --arg path "$grpc_service" \
+            --arg sni "$grpc_sni" \
+            --arg alpn "$grpc_alpn" \
             '{v: "2", ps: $ps, add: $add, port: ($port | tostring), id: $id, aid: "0",
-              scy: "auto", net: "xhttp", type: "none", host: $host, path: $path,
-              tls: "tls", sni: $sni, alpn: $alpn, fp: "chrome", mode: $mode}')
-        xhttp_link="vmess://$(printf '%s' "$xhttp_vmess_json" | base64 | tr -d '\n')"
+              scy: "auto", net: "grpc", type: "gun", host: $host, path: $path,
+              tls: "tls", sni: $sni, alpn: $alpn, fp: "chrome"}')
+        grpc_link="vmess://$(printf '%s' "$grpc_vmess_json" | base64 | tr -d '\n')"
         echo -e "  分享链接 (Link):"
-        echo -e "  ${YELLOW}${xhttp_link}${PLAIN}"
+        echo -e "  ${YELLOW}${grpc_link}${PLAIN}"
         echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
         jq -n \
-            --arg name "Xray-VMess-XHTTP-TLS" \
-            --arg server "$xhttp_sni" \
-            --argjson port "$xhttp_port" \
-            --arg uuid "$xhttp_uuid" \
-            --arg sni "$xhttp_sni" \
-            --arg alpn "$xhttp_alpn" \
-            --arg path "$xhttp_path" \
-            --arg mode "$xhttp_mode" \
+            --arg name "Xray-VMess-gRPC-TLS" \
+            --arg server "$grpc_sni" \
+            --argjson port "$grpc_port" \
+            --arg uuid "$grpc_uuid" \
+            --arg sni "$grpc_sni" \
+            --arg alpn "$grpc_alpn" \
+            --arg service "$grpc_service" \
             '{
               name: $name,
               type: "vmess",
@@ -462,11 +464,9 @@ view_inbound_info() {
               alpn: [$alpn],
               "client-fingerprint": "chrome",
               "skip-cert-verify": false,
-              network: "xhttp",
-              "xhttp-opts": {
-                path: $path,
-                host: $sni,
-                mode: $mode
+              network: "grpc",
+              "grpc-opts": {
+                "grpc-service-name": $service
               }
             }'
         echo -e "----------------------------------------------------------------"
@@ -490,7 +490,7 @@ generate_production_config() {
 
     local ws_domain=""
     while [[ -z "$ws_domain" ]]; do
-        read -rp "请输入 VMess (WS/XHTTP) 入站绑定的域名: " ws_domain </dev/tty
+        read -rp "请输入 VMess (WS/gRPC) 入站绑定的域名: " ws_domain </dev/tty
         ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
         ws_domain=${ws_domain%.}
         ws_domain=${ws_domain,,}
@@ -625,7 +625,7 @@ generate_production_config() {
       }
     },
     {
-      "tag": "vmess-xhttp-tls-in",
+      "tag": "vmess-grpc-tls-in",
       "port": 2053,
       "listen": "0.0.0.0",
       "protocol": "vmess",
@@ -637,7 +637,7 @@ generate_production_config() {
         ]
       },
       "streamSettings": {
-        "network": "xhttp",
+        "network": "grpc",
         "security": "tls",
         "tlsSettings": {
           "serverName": "${ws_domain}",
@@ -651,9 +651,8 @@ generate_production_config() {
             }
           ]
         },
-        "xhttpSettings": {
-          "path": "/175443",
-          "mode": "packet-up"
+        "grpcSettings": {
+          "serviceName": "175443"
         }
       },
       "sniffing": {
