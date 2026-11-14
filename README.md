@@ -9,11 +9,11 @@
 
 ## 环境要求
 
-- Linux，使用 systemd 管理服务
+- Linux，使用 systemd（Debian/Ubuntu/CentOS 等）或 OpenRC（Alpine 等）管理服务
 - root 权限运行
+- 需要 bash 4+（Alpine 需先手动安装 bash，见下文）
 - 支持架构：x86_64、arm64、armv7、s390x、riscv64
-- 依赖：`curl`、`wget`、`jq`、`openssl`、`tar`/`unzip`（脚本会自动安装）
-- 建议安装 `iproute2`（提供 `ss` 命令），用于安装前的端口占用检查
+- 依赖：`curl`、`wget`、`jq`、`openssl`、`tar`/`unzip`、`iproute2`（脚本会自动安装；bash 必须预先存在）
 
 ## 安装
 
@@ -29,7 +29,23 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install
 bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_singbox.sh)
 ```
 
-安装流程：安装依赖 → 应用 BBR/网络优化 → 下载内核 → **交互选择入站协议** → 生成配置 → 注册 systemd 服务 → 启动。
+安装流程：安装依赖 → 应用 BBR/网络优化 → 下载内核 → **交互选择入站协议** → 生成配置 → 注册服务（systemd/OpenRC）→ 启动。
+
+### Alpine Linux
+
+Alpine 默认使用 OpenRC，且未预装 bash，请先安装 bash 再执行脚本：
+
+```shell
+apk add --no-cache bash curl ca-certificates
+bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_xray.sh)
+```
+
+sing-box 同理，把文件名换成 `install_singbox.sh` 即可。
+
+脚本会自动识别服务管理器：
+
+- systemd：注册 `/etc/systemd/system/xray.service` 或 `sing-box.service`，日志通过 `journalctl` 查看
+- OpenRC：生成 `/etc/init.d/xray` 或 `/etc/init.d/sing-box`，日志写入 `/var/log/xray.log` 或 `/var/log/sing-box.log`
 
 ## 入站协议选择
 
@@ -130,6 +146,9 @@ sb restart
 - `/etc/security/limits.d/99-nofile.conf`
 
 启用 `fq` + `bbr`，并调整 TCP 缓冲区与文件描述符上限。可通过 `xr bbr` / `sb bbr` 查看状态并重新应用。
+
+- systemd：由 `sysctl --system` 在开机时加载
+- OpenRC（Alpine）：额外写入 `/etc/local.d/99-network-bbr.start`，通过 `local` 服务开机应用；服务本身的 nofile 限制由 init 脚本中的 `rc_ulimit` 设置
 
 ## 更新与卸载
 

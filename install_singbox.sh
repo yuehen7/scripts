@@ -2,7 +2,17 @@
 # =========================================================
 # sing-box 一键安装、服务管理、BBR 调优、配置生成与节点查看脚本
 # 入站: 可选 Shadowsocks(32443) / VLESS-Reality(443) / VMess-WS-TLS(2053)
+# 支持 systemd (Debian/Ubuntu/CentOS 等) 与 OpenRC (Alpine 等)
 # =========================================================
+
+# 允许通过 sh 调用：自动切换到 bash（此处必须使用 POSIX 语法）
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    fi
+    echo "错误：本脚本需要 bash，请先执行 apk add --no-cache bash（Alpine）或安装 bash 后重试。" >&2
+    exit 1
+fi
 
 # 颜色配置
 RED='\033[0;31m'
@@ -16,9 +26,13 @@ CONFIG_DIR="/etc/sing-box"
 CERT_DIR="${CONFIG_DIR}/cert"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 SYSTEMD_FILE="/etc/systemd/system/sing-box.service"
+INITD_FILE="/etc/init.d/sing-box"
+SERVICE_NAME="sing-box"
+SERVICE_LOG="/var/log/sing-box.log"
 CLI_TARGET="/usr/local/bin/sb"
 SYSCTL_BBR_FILE="/etc/sysctl.d/99-network-bbr.conf"
 LIMITS_FILE="/etc/security/limits.d/99-nofile.conf"
+LOCAL_D_FILE="/etc/local.d/99-network-bbr.start"
 
 # 入站协议候选参数
 SS_PORT=32443
@@ -30,6 +44,93 @@ VMESS_WS_PATH="/175443"
 FIXED_UUID="8326d9fd-3246-4ca0-aa48-894f0e7d96d6"
 
 set -o pipefail
+
+# 检测服务管理器：systemd / OpenRC
+detect_init_system() {
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null 2>&1; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    else
+        INIT_SYSTEM="unknown"
+    fi
+}
+detect_init_system
+
+# 服务控制封装，兼容 systemd 与 OpenRC
+service_start() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl start "$SERVICE_NAME" ;;
+        openrc) rc-service "$SERVICE_NAME" start ;;
+        *) echo -e "${RED}未检测到 systemd 或 OpenRC，无法管理服务。${PLAIN}"; return 1 ;;
+    esac
+}
+
+service_stop() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl stop "$SERVICE_NAME" ;;
+        openrc) rc-service "$SERVICE_NAME" stop ;;
+        *) return 1 ;;
+    esac
+}
+
+service_restart() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl restart "$SERVICE_NAME" ;;
+        openrc) rc-service "$SERVICE_NAME" restart ;;
+        *) return 1 ;;
+    esac
+}
+
+service_is_active() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet "$SERVICE_NAME" ;;
+        openrc) rc-service "$SERVICE_NAME" status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+service_logs_follow() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        journalctl -u "$SERVICE_NAME" -f -o cat
+    else
+        touch "$SERVICE_LOG" 2>/dev/null || true
+        tail -f "$SERVICE_LOG"
+    fi
+}
+
+service_logs_recent() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        journalctl -u "$SERVICE_NAME" --no-pager -n 40 -o cat 2>/dev/null || true
+    elif [[ -f "$SERVICE_LOG" ]]; then
+        tail -n 40 "$SERVICE_LOG"
+    fi
+}
+
+service_remove() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+            rm -f "$SYSTEMD_FILE"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            ;;
+        openrc)
+            rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
+            rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
+            rm -f "$INITD_FILE"
+            ;;
+    esac
+}
+
+# 重新加载 sysctl 配置，兼容 systemd 与 busybox/procps
+reload_sysctl() {
+    if sysctl --system >/dev/null 2>&1; then
+        return 0
+    fi
+    [[ -f "$SYSCTL_BBR_FILE" ]] && sysctl -p "$SYSCTL_BBR_FILE" >/dev/null 2>&1
+    return 0
+}
 
 # 检查 root 权限
 [[ $EUID -ne 0 ]] && echo -e "${RED}错误：请以 root 权限运行此脚本！${PLAIN}" && exit 1
@@ -48,10 +149,13 @@ install_deps() {
     elif command -v zypper >/dev/null 2>&1; then
         zypper install -y curl wget tar jq openssl systemd
     elif command -v apk >/dev/null 2>&1; then
-        apk add --no-cache curl wget tar jq openssl
+        apk add --no-cache bash curl wget tar jq openssl iproute2 ca-certificates openrc
     else
-        echo -e "${YELLOW}未识别的包管理器，请确保已安装 curl, wget, tar, jq, openssl${PLAIN}"
+        echo -e "${YELLOW}未识别的包管理器，请确保已安装 bash, curl, wget, tar, jq, openssl${PLAIN}"
     fi
+
+    # 依赖安装完成后重新检测服务管理器（例如最小化 Alpine 环境）
+    detect_init_system
 }
 
 # 检测系统架构
@@ -220,7 +324,17 @@ root soft nofile 1048576
 root hard nofile 1048576
 EOF
 
-    sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_BBR_FILE" >/dev/null 2>&1
+    # OpenRC 默认不读取 sysctl.d，通过 local.d 在开机时应用
+    if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+        mkdir -p /etc/local.d
+        cat << 'EOF' > "$LOCAL_D_FILE"
+#!/bin/sh
+sysctl -p /etc/sysctl.d/99-network-bbr.conf >/dev/null 2>&1
+EOF
+        chmod 0755 "$LOCAL_D_FILE"
+    fi
+
+    reload_sysctl
     local cc
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
     echo -e "${GREEN}网络栈调优完成，当前拥塞控制算法: ${cc}${PLAIN}"
@@ -703,9 +817,11 @@ generate_production_config() {
     view_inbound_info
 }
 
-# 注册 Systemd 服务
+# 注册系统服务（systemd / OpenRC）
 setup_service() {
-    cat << EOF > "$SYSTEMD_FILE"
+    case "$INIT_SYSTEM" in
+        systemd)
+            cat << EOF > "$SYSTEMD_FILE"
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
@@ -727,25 +843,64 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    if ! systemctl enable sing-box >/dev/null 2>&1; then
-        echo -e "${RED}设置开机自启失败，请手动执行 systemctl enable sing-box 排查。${PLAIN}"
-        return 1
-    fi
-    echo -e "${GREEN}Systemd 系统服务已注册。${PLAIN}"
+            systemctl daemon-reload || return 1
+            if ! systemctl enable "$SERVICE_NAME" >/dev/null 2>&1; then
+                echo -e "${RED}设置开机自启失败，请手动执行 systemctl enable sing-box 排查。${PLAIN}"
+                return 1
+            fi
+            echo -e "${GREEN}systemd 服务已注册并配置为开机自启。${PLAIN}"
+            ;;
+        openrc)
+            cat << EOF > "$INITD_FILE"
+#!/sbin/openrc-run
+
+name="${SERVICE_NAME}"
+description="sing-box service"
+
+supervisor="supervise-daemon"
+command="${INSTALL_DIR}/sing-box"
+command_args="run -c ${CONFIG_FILE}"
+pidfile="/run/${SERVICE_NAME}.pid"
+respawn_delay=5
+respawn_max=0
+output_log="${SERVICE_LOG}"
+error_log="${SERVICE_LOG}"
+rc_ulimit="-n 1048576"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    ${INSTALL_DIR}/sing-box check -c ${CONFIG_FILE}
+}
+EOF
+            chmod 0755 "$INITD_FILE"
+            if ! rc-update add "$SERVICE_NAME" default >/dev/null 2>&1; then
+                echo -e "${RED}无法将 sing-box 加入 OpenRC 默认运行级别。${PLAIN}"
+                return 1
+            fi
+            echo -e "${GREEN}OpenRC 服务已注册并配置为开机自启。${PLAIN}"
+            ;;
+        *)
+            echo -e "${RED}未检测到 systemd 或 OpenRC，无法注册服务。${PLAIN}"
+            return 1
+            ;;
+    esac
 }
 
 # 启动失败时输出最近日志与排查建议
 show_start_failure() {
-    echo -e "${RED}sing-box 启动失败。以下是最近的 systemd 日志：${PLAIN}"
-    journalctl -u sing-box --no-pager -n 40 -o cat 2>/dev/null || true
+    echo -e "${RED}sing-box 启动失败。以下是最近的日志：${PLAIN}"
+    service_logs_recent
     echo -e "${YELLOW}可依次执行：sb test、ss -ltnp | grep -E ':(${SS_PORT}|${REALITY_PORT}|${VMESS_WS_PORT})'、sb log 进行排查。${PLAIN}"
 }
 
 # 服务控制函数
 start_service() {
     test_config || return 1
-    if systemctl start sing-box; then
+    if service_start; then
         echo -e "${GREEN}sing-box 服务已启动。${PLAIN}"
         check_status
     else
@@ -755,13 +910,13 @@ start_service() {
 }
 
 stop_service() {
-    systemctl stop sing-box
+    service_stop
     echo -e "${YELLOW}sing-box 已停止。${PLAIN}"
 }
 
 restart_service() {
     test_config || return 1
-    if systemctl restart sing-box; then
+    if service_restart; then
         echo -e "${GREEN}sing-box 已重启。${PLAIN}"
         check_status
     else
@@ -771,7 +926,7 @@ restart_service() {
 }
 
 check_status() {
-    if systemctl is-active --quiet sing-box; then
+    if service_is_active; then
         echo -e "运行状态: ${GREEN}运行中 (Active)${PLAIN}"
     else
         echo -e "运行状态: ${RED}未运行 (Inactive)${PLAIN}"
@@ -780,7 +935,7 @@ check_status() {
 }
 
 view_logs() {
-    journalctl -u sing-box -f -o cat
+    service_logs_follow
 }
 
 test_config() {
@@ -854,11 +1009,11 @@ update_core() {
         return 1
     fi
 
-    systemctl stop sing-box
+    service_stop
     mv "${tmp_dir}/sing-box-${version}-${ARCH}/sing-box" "${INSTALL_DIR}/sing-box"
     chmod +x "${INSTALL_DIR}/sing-box"
     rm -rf "$tmp_dir"
-    if ! systemctl start sing-box; then
+    if ! service_start; then
         show_start_failure
         return 1
     fi
@@ -881,10 +1036,7 @@ uninstall_all() {
     read -rp "确定要完全卸载 sing-box 吗？[y/N]: " confirm </dev/tty
     [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
 
-    systemctl stop sing-box >/dev/null 2>&1 || true
-    systemctl disable sing-box >/dev/null 2>&1 || true
-    rm -f "$SYSTEMD_FILE"
-    systemctl daemon-reload
+    service_remove
 
     rm -f "${INSTALL_DIR}/sing-box"
     rm -f "$CLI_TARGET"
@@ -894,8 +1046,8 @@ uninstall_all() {
 
     read -rp "是否还原/删除 BBR 与网络优化配置文件？[y/N]: " del_bbr </dev/tty
     if [[ "$del_bbr" =~ ^[Yy]$ ]]; then
-        rm -f "$SYSCTL_BBR_FILE" "$LIMITS_FILE"
-        sysctl --system >/dev/null 2>&1 || true
+        rm -f "$SYSCTL_BBR_FILE" "$LIMITS_FILE" "$LOCAL_D_FILE"
+        reload_sysctl
         echo -e "${YELLOW}BBR 与网络配置文件已移除。${PLAIN}"
     fi
 
