@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
 # sing-box 一键安装、服务管理、BBR 调优、配置生成与节点查看脚本
-# 入站: VLESS-Reality(443) + VMess-WS-TLS(8443)
+# 入站: 可选 Shadowsocks(32443) / VLESS-Reality(443) / VMess-WS-TLS(2053)
 # =========================================================
 
 # 颜色配置
@@ -19,6 +19,15 @@ SYSTEMD_FILE="/etc/systemd/system/sing-box.service"
 CLI_TARGET="/usr/local/bin/sb"
 SYSCTL_BBR_FILE="/etc/sysctl.d/99-network-bbr.conf"
 LIMITS_FILE="/etc/security/limits.d/99-nofile.conf"
+
+# 入站协议候选参数
+SS_PORT=32443
+SS_METHOD="2022-blake3-aes-128-gcm"
+REALITY_PORT=443
+VMESS_WS_PORT=2053
+VMESS_WS_PATH="/175443"
+# VLESS-Reality 与 VMess-WS-TLS 共用固定 UUID
+FIXED_UUID="8326d9fd-3246-4ca0-aa48-894f0e7d96d6"
 
 set -o pipefail
 
@@ -276,9 +285,60 @@ view_inbound_info() {
     local ws_tag
     ws_tag=$(jq -r '.inbounds[] | select(.tag=="vmess-ws-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
 
+    # 解析 Shadowsocks 入站
+    local ss_tag
+    ss_tag=$(jq -r '.inbounds[] | select(.tag=="shadowsocks-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+
+    if jq -e 'any(.inbounds[]?; .tag == "vless-ws-tls-in")' "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${YELLOW}提示: 检测到旧版 VLESS-WS-TLS 入站，当前版本已改为 VMess-WS-TLS。${PLAIN}"
+        echo -e "${YELLOW}      执行 'sb gen' 可重新选择并生成入站配置。${PLAIN}"
+    fi
+
+    if [[ -z "$ss_tag" && -z "$r_tag" && -z "$ws_tag" ]]; then
+        echo -e "${RED}未找到可识别的入站配置，请执行 'sb gen' 重新生成。${PLAIN}"
+        return 1
+    fi
+
     echo -e "\n${CYAN}================================================================${PLAIN}"
     echo -e "${CYAN}                     当前入站节点配置详情                       ${PLAIN}"
     echo -e "${CYAN}================================================================${PLAIN}"
+
+    if [[ -n "$ss_tag" ]]; then
+        local ss_port ss_method ss_password
+        ss_port=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .listen_port' "$CONFIG_FILE")
+        ss_method=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .method' "$CONFIG_FILE")
+        ss_password=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .password' "$CONFIG_FILE")
+
+        echo -e "${GREEN}【协议: Shadowsocks (SS2022)】${PLAIN}"
+        echo -e "  地址 (Address):     ${CYAN}${server_ip}${PLAIN}"
+        echo -e "  端口 (Port):        ${CYAN}${ss_port}${PLAIN}"
+        echo -e "  加密方式 (Method):  ${CYAN}${ss_method}${PLAIN}"
+        echo -e "  密码 (Password):    ${CYAN}${ss_password}${PLAIN}"
+
+        # SIP002: ss://base64url(method:password)@host:port#tag
+        local ss_userinfo ss_link
+        ss_userinfo=$(printf '%s' "${ss_method}:${ss_password}" | base64 | tr '+/' '-_' | tr -d '=\n')
+        ss_link="ss://${ss_userinfo}@${server_ip}:${ss_port}#sing-box-Shadowsocks"
+        echo -e "  分享链接 (Link):"
+        echo -e "  ${YELLOW}${ss_link}${PLAIN}"
+        echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
+        jq -n \
+            --arg name "sing-box-Shadowsocks" \
+            --arg server "$server_ip" \
+            --argjson port "$ss_port" \
+            --arg cipher "$ss_method" \
+            --arg password "$ss_password" \
+            '{
+              name: $name,
+              type: "ss",
+              server: $server,
+              port: $port,
+              udp: true,
+              cipher: $cipher,
+              password: $password
+            }'
+        echo -e "----------------------------------------------------------------"
+    fi
 
     if [[ -n "$r_tag" ]]; then
         local r_port r_uuid r_flow r_sni r_pri r_sid r_pub
@@ -295,7 +355,7 @@ view_inbound_info() {
             r_pub=$(tr -d '[:space:]' < "${CONFIG_DIR}/reality_pub.key")
         fi
 
-        echo -e "${GREEN}【协议 1: VLESS + Reality (直连推荐)】${PLAIN}"
+        echo -e "${GREEN}【协议: VLESS + Reality (直连推荐)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${server_ip}${PLAIN}"
         echo -e "  端口 (Port):        ${CYAN}${r_port}${PLAIN}"
         echo -e "  用户 ID (UUID):     ${CYAN}${r_uuid}${PLAIN}"
@@ -324,7 +384,7 @@ view_inbound_info() {
         ws_sni=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .tls.server_name' "$CONFIG_FILE")
         ws_path=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .transport.path' "$CONFIG_FILE")
 
-        echo -e "${GREEN}【协议 2: VMess + WS + TLS (支持 CDN 回源)】${PLAIN}"
+        echo -e "${GREEN}【协议: VMess + WS + TLS (支持 CDN 回源)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${ws_sni} (或填服务器 IP / CDN 优选 IP)${PLAIN}"
         echo -e "  端口 (Port):        ${CYAN}${ws_port}${PLAIN}"
         echo -e "  用户 ID (UUID):     ${CYAN}${ws_uuid}${PLAIN}"
@@ -377,175 +437,267 @@ view_inbound_info() {
               }
             }'
         echo -e "----------------------------------------------------------------"
-    else
-        echo -e "${YELLOW}【协议 2】未找到 VMess-WS-TLS 入站 (tag: vmess-ws-tls-in)。${PLAIN}"
-        echo -e "${YELLOW}  旧配置仍是 vless-ws-tls-in，请执行 'sb gen' 重新生成配置。${PLAIN}"
-        echo -e "----------------------------------------------------------------"
     fi
 
-    echo -e "${RED}证书目录检查:${PLAIN}"
-    echo -e "  公钥证书: ${CERT_DIR}/fullchain.pem $([[ -f "${CERT_DIR}/fullchain.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
-    echo -e "  私钥证书: ${CERT_DIR}/privkey.pem   $([[ -f "${CERT_DIR}/privkey.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
+    if [[ -n "$ws_tag" ]]; then
+        echo -e "${RED}证书目录检查:${PLAIN}"
+        echo -e "  公钥证书: ${CERT_DIR}/fullchain.pem $([[ -f "${CERT_DIR}/fullchain.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
+        echo -e "  私钥证书: ${CERT_DIR}/privkey.pem   $([[ -f "${CERT_DIR}/privkey.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
+    else
+        echo -e "${CYAN}当前未启用 TLS 入站，无需配置证书。${PLAIN}"
+    fi
     echo -e "${CYAN}================================================================${PLAIN}\n"
 }
 
-# 生成双入站、嗅探与基础拦截规则的配置
+
+# 交互选择需要启用的入站协议（至少一个）
+select_inbound_protocols() {
+    ENABLE_SS=0
+    ENABLE_REALITY=0
+    ENABLE_VMESS=0
+    SELECTED_PORTS=()
+
+    local input token
+    while true; do
+        echo -e "\n${CYAN}请选择要启用的入站协议（可多选，至少选择一个）：${PLAIN}"
+        echo -e "  ${GREEN}1)${PLAIN} Shadowsocks      ${YELLOW}端口 ${SS_PORT}，加密 ${SS_METHOD}${PLAIN}"
+        echo -e "  ${GREEN}2)${PLAIN} VLESS + Reality  ${YELLOW}端口 ${REALITY_PORT}${PLAIN}"
+        echo -e "  ${GREEN}3)${PLAIN} VMess + WS + TLS ${YELLOW}端口 ${VMESS_WS_PORT}${PLAIN}"
+        read -rp "请输入编号（多个用空格或逗号分隔，输入 all 全选）: " input </dev/tty || return 1
+        input=$(printf '%s' "$input" | tr ',' ' ')
+
+        local ss=0 reality=0 vmess=0 invalid=0
+        for token in $input; do
+            case "$token" in
+                1) ss=1 ;;
+                2) reality=1 ;;
+                3) vmess=1 ;;
+                all|ALL|All) ss=1; reality=1; vmess=1 ;;
+                *) invalid=1 ;;
+            esac
+        done
+
+        if [[ $invalid -eq 1 || $((ss + reality + vmess)) -eq 0 ]]; then
+            echo -e "${RED}输入无效，请输入 1、2、3 的组合（如 1,3），或输入 all。${PLAIN}"
+            continue
+        fi
+
+        ENABLE_SS=$ss
+        ENABLE_REALITY=$reality
+        ENABLE_VMESS=$vmess
+        break
+    done
+
+    [[ $ENABLE_SS -eq 1 ]] && SELECTED_PORTS+=("$SS_PORT")
+    [[ $ENABLE_REALITY -eq 1 ]] && SELECTED_PORTS+=("$REALITY_PORT")
+    [[ $ENABLE_VMESS -eq 1 ]] && SELECTED_PORTS+=("$VMESS_WS_PORT")
+
+    echo -e "${GREEN}已选择入站协议：${PLAIN}"
+    [[ $ENABLE_SS -eq 1 ]] && echo -e "  - Shadowsocks (${SS_PORT})"
+    [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality (${REALITY_PORT})"
+    [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS (${VMESS_WS_PORT})"
+    return 0
+}
+
+# 按用户选择的协议生成入站、嗅探与基础拦截规则的配置
 generate_production_config() {
     mkdir -p "$CONFIG_DIR"
     mkdir -p "$CERT_DIR"
-    ensure_dummy_cert || return 1
 
     echo -e "\n${CYAN}=================================================${PLAIN}"
-    echo -e "${CYAN}      sing-box 节点配置生成器 (Dual-Inbound)       ${PLAIN}"
+    echo -e "${CYAN}      sing-box 节点配置生成器 (可选多入站)        ${PLAIN}"
     echo -e "${CYAN}=================================================${PLAIN}"
 
+    select_inbound_protocols || return 1
+
     local ws_domain=""
-    while [[ -z "$ws_domain" ]]; do
-        read -rp "请输入 VMess-WS-TLS 入站绑定的域名 (例如: node.yourdomain.com): " ws_domain </dev/tty
-        ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
-        ws_domain=${ws_domain%.}
-        ws_domain=${ws_domain,,}
-        if ! validate_domain "$ws_domain"; then
-            echo -e "${RED}域名格式无效，请输入完整的域名，例如 node.example.com。${PLAIN}"
-            ws_domain=""
+    if [[ $ENABLE_VMESS -eq 1 ]]; then
+        ensure_dummy_cert || return 1
+        while [[ -z "$ws_domain" ]]; do
+            read -rp "请输入 VMess-WS-TLS 入站绑定的域名 (例如: node.yourdomain.com): " ws_domain </dev/tty
+            ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
+            ws_domain=${ws_domain%.}
+            ws_domain=${ws_domain,,}
+            if ! validate_domain "$ws_domain"; then
+                echo -e "${RED}域名格式无效，请输入完整的域名，例如 node.example.com。${PLAIN}"
+                ws_domain=""
+            fi
+        done
+    fi
+
+    # VLESS 与 VMess 共用固定 UUID
+    local uuid="$FIXED_UUID"
+
+    local reality_domain="" private_key="" public_key="" short_id=""
+    if [[ $ENABLE_REALITY -eq 1 ]]; then
+        echo -e "${YELLOW}正在生成 Reality 密钥对与 Short-ID...${PLAIN}"
+        reality_domain=$(select_reality_target) || {
+            echo -e "${RED}无法选择 Reality 伪装目标，未写入新配置。请检查服务器的 IPv4 出站网络后重试。${PLAIN}"
+            return 1
+        }
+
+        local keypair
+        keypair=$(${INSTALL_DIR}/sing-box generate reality-keypair) || {
+            echo -e "${RED}无法生成 Reality 密钥对。${PLAIN}"
+            return 1
+        }
+        private_key=$(echo "$keypair" | grep -iE 'Private[[:space:]]*key' | awk '{print $2}' | tr -d '[:space:]')
+        public_key=$(echo "$keypair" | grep -iE 'Public[[:space:]]*key' | awk '{print $2}' | tr -d '[:space:]')
+
+        if [[ -z "$private_key" || -z "$public_key" ]]; then
+            echo -e "${RED}无法解析 Reality 密钥对，sing-box 版本可能不兼容。${PLAIN}"
+            return 1
         fi
-    done
 
-    local reality_domain
-    reality_domain=$(select_reality_target) || {
-        echo -e "${RED}无法选择 Reality 伪装目标，未写入新配置。请检查服务器的 IPv4 出站网络后重试。${PLAIN}"
-        return 1
-    }
+        # 将生成的公钥留存一份备查
+        echo "$public_key" > "${CONFIG_DIR}/reality_pub.key"
+        short_id=$(openssl rand -hex 8 2>/dev/null || ${INSTALL_DIR}/sing-box generate rand --hex 8)
+    fi
 
-    echo -e "${YELLOW}正在自动生成 UUID、Reality 密钥对与 Short-ID...${PLAIN}"
-    local uuid
-    uuid=$(${INSTALL_DIR}/sing-box generate uuid) || {
-        echo -e "${RED}无法生成 UUID。${PLAIN}"
-        return 1
-    }
-    
-    local keypair
-    keypair=$(${INSTALL_DIR}/sing-box generate reality-keypair) || {
-        echo -e "${RED}无法生成 Reality 密钥对。${PLAIN}"
-        return 1
-    }
-    local private_key
-    private_key=$(echo "$keypair" | grep -iE 'Private[[:space:]]*key' | awk '{print $2}' | tr -d '[:space:]')
-    local public_key
-    public_key=$(echo "$keypair" | grep -iE 'Public[[:space:]]*key' | awk '{print $2}' | tr -d '[:space:]')
+    local ss_password=""
+    if [[ $ENABLE_SS -eq 1 ]]; then
+        # 2022-blake3-aes-128-gcm 需要 16 字节密钥（base64 编码）
+        ss_password=$(openssl rand -base64 16 | tr -d '\n')
+    fi
 
-    if [[ -z "$private_key" || -z "$public_key" ]]; then
-        echo -e "${RED}无法解析 Reality 密钥对，sing-box 版本可能不兼容。${PLAIN}"
+    local inbounds='[]'
+
+    if [[ $ENABLE_SS -eq 1 ]]; then
+        inbounds=$(jq -c \
+            --argjson port "$SS_PORT" \
+            --arg method "$SS_METHOD" \
+            --arg password "$ss_password" \
+            '. + [{
+              "type": "shadowsocks",
+              "tag": "shadowsocks-in",
+              "listen": "::",
+              "listen_port": $port,
+              "method": $method,
+              "password": $password,
+              "network": "tcp,udp"
+            }]' <<<"$inbounds") || return 1
+    fi
+
+    if [[ $ENABLE_REALITY -eq 1 ]]; then
+        inbounds=$(jq -c \
+            --argjson port "$REALITY_PORT" \
+            --arg uuid "$uuid" \
+            --arg domain "$reality_domain" \
+            --arg private_key "$private_key" \
+            --arg short_id "$short_id" \
+            '. + [{
+              "type": "vless",
+              "tag": "vless-reality-in",
+              "listen": "::",
+              "listen_port": $port,
+              "users": [
+                {
+                  "uuid": $uuid,
+                  "flow": "xtls-rprx-vision"
+                }
+              ],
+              "tls": {
+                "enabled": true,
+                "server_name": $domain,
+                "reality": {
+                  "enabled": true,
+                  "handshake": {
+                    "server": $domain,
+                    "server_port": 443
+                  },
+                  "private_key": $private_key,
+                  "short_id": [
+                    $short_id
+                  ]
+                }
+              }
+            }]' <<<"$inbounds") || return 1
+    fi
+
+    if [[ $ENABLE_VMESS -eq 1 ]]; then
+        inbounds=$(jq -c \
+            --argjson port "$VMESS_WS_PORT" \
+            --arg uuid "$uuid" \
+            --arg domain "$ws_domain" \
+            --arg path "$VMESS_WS_PATH" \
+            --arg cert "${CERT_DIR}/fullchain.pem" \
+            --arg key "${CERT_DIR}/privkey.pem" \
+            '. + [{
+              "type": "vmess",
+              "tag": "vmess-ws-tls-in",
+              "listen": "::",
+              "listen_port": $port,
+              "users": [
+                {
+                  "uuid": $uuid,
+                  "alterId": 0
+                }
+              ],
+              "tls": {
+                "enabled": true,
+                "server_name": $domain,
+                "certificate_path": $cert,
+                "key_path": $key
+              },
+              "transport": {
+                "type": "ws",
+                "path": $path,
+                "max_early_data": 2048,
+                "early_data_header_name": "Sec-WebSocket-Protocol"
+              }
+            }]' <<<"$inbounds") || return 1
+    fi
+
+    if ! jq -n --argjson inbounds "$inbounds" '{
+      "log": {
+        "disabled": false,
+        "level": "info",
+        "timestamp": true
+      },
+      "inbounds": $inbounds,
+      "outbounds": [
+        {
+          "type": "direct",
+          "tag": "direct"
+        }
+      ],
+      "route": {
+        "rules": [
+          {
+            "action": "sniff",
+            "sniffer": [
+              "http",
+              "tls",
+              "quic"
+            ]
+          },
+          {
+            "rule_set": [
+              "geosite-category-ads-all"
+            ],
+            "action": "reject"
+          },
+          {
+            "ip_is_private": true,
+            "action": "reject"
+          }
+        ],
+        "rule_set": [
+          {
+            "type": "remote",
+            "tag": "geosite-category-ads-all",
+            "format": "binary",
+            "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+            "download_detour": "direct"
+          }
+        ],
+        "final": "direct",
+        "auto_detect_interface": true
+      }
+    }' > "$CONFIG_FILE"; then
+        echo -e "${RED}配置文件写入失败，请检查 jq 是否可用。${PLAIN}"
         return 1
     fi
-    
-    # 将生成的公钥留存一份备查
-    echo "$public_key" > "${CONFIG_DIR}/reality_pub.key"
-
-    local short_id
-    short_id=$(openssl rand -hex 8 2>/dev/null || ${INSTALL_DIR}/sing-box generate rand --hex 8)
-
-    cat << EOF > "$CONFIG_FILE"
-{
-  "log": {
-    "disabled": false,
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-reality-in",
-      "listen": "::",
-      "listen_port": 443,
-      "users": [
-        {
-          "uuid": "${uuid}",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${reality_domain}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${reality_domain}",
-            "server_port": 443
-          },
-          "private_key": "${private_key}",
-          "short_id": [
-            "${short_id}"
-          ]
-        }
-      }
-    },
-    {
-      "type": "vmess",
-      "tag": "vmess-ws-tls-in",
-      "listen": "::",
-      "listen_port": 8443,
-      "users": [
-        {
-          "uuid": "${uuid}",
-          "alterId": 0
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${ws_domain}",
-        "certificate_path": "${CERT_DIR}/fullchain.pem",
-        "key_path": "${CERT_DIR}/privkey.pem"
-      },
-      "transport": {
-        "type": "ws",
-        "path": "/175443",
-        "max_early_data": 2048,
-        "early_data_header_name": "Sec-WebSocket-Protocol"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "rules": [
-      {
-        "action": "sniff",
-        "sniffer": [
-          "http",
-          "tls",
-          "quic"
-        ]
-      },
-      {
-        "rule_set": [
-          "geosite-category-ads-all"
-        ],
-        "action": "reject"
-      },
-      {
-        "ip_is_private": true,
-        "action": "reject"
-      }
-    ],
-    "rule_set": [
-      {
-        "type": "remote",
-        "tag": "geosite-category-ads-all",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
-        "download_detour": "direct"
-      }
-    ],
-    "final": "direct",
-    "auto_detect_interface": true
-  }
-}
-EOF
 
     echo -e "${GREEN}配置文件生成并写入成功！${PLAIN}"
     view_inbound_info
@@ -587,7 +739,7 @@ EOF
 show_start_failure() {
     echo -e "${RED}sing-box 启动失败。以下是最近的 systemd 日志：${PLAIN}"
     journalctl -u sing-box --no-pager -n 40 -o cat 2>/dev/null || true
-    echo -e "${YELLOW}可依次执行：sb test、ss -ltnp | grep -E ':(443|8443)'、sb log 进行排查。${PLAIN}"
+    echo -e "${YELLOW}可依次执行：sb test、ss -ltnp | grep -E ':(${SS_PORT}|${REALITY_PORT}|${VMESS_WS_PORT})'、sb log 进行排查。${PLAIN}"
 }
 
 # 服务控制函数
@@ -640,7 +792,10 @@ test_config() {
         echo -e "${RED}未找到配置文件：${CONFIG_FILE}${PLAIN}"
         return 1
     fi
-    check_certificate_files || return 1
+    # 仅在启用 VMess-WS-TLS 入站时才校验证书文件
+    if jq -e 'any(.inbounds[]?; .tag == "vmess-ws-tls-in")' "$CONFIG_FILE" >/dev/null 2>&1; then
+        check_certificate_files || return 1
+    fi
     echo -e "${YELLOW}正在检查 sing-box 配置...${PLAIN}"
     ${INSTALL_DIR}/sing-box check -c "$CONFIG_FILE"
 }
@@ -775,7 +930,7 @@ ${GREEN}sing-box 服务管理工具 (sb)${PLAIN}
  6. 查看入站节点配置 (info)
  7. 检查配置文件 (check)
  8. 编辑配置文件 (edit)
- 9. 重新生成双协议配置 (gen)
+ 9. 重新生成入站配置 (gen)
 10. 更新 sing-box 内核 (update)
 11. BBR 状态与网络调优 (bbr)
 12. 卸载 sing-box (uninstall)
@@ -824,11 +979,15 @@ main() {
                 apply_bbr_and_optimization
                 download_singbox
                 generate_production_config || exit 1
+
+                # 仅检查用户实际选择的入站端口
+                for port in "${SELECTED_PORTS[@]}"; do
+                    check_port_available "$port" || exit 1
+                done
+
                 setup_service
                 install_cli
 
-                check_port_available 443 || exit 1
-                check_port_available 8443 || exit 1
                 if ! start_service; then
                     echo -e "${RED}安装完成，但 sing-box 未能启动；请按上方日志修复后执行 sb start。${PLAIN}"
                     exit 1
@@ -840,7 +999,9 @@ main() {
                 echo -e " 证书目录: ${CERT_DIR}/"
                 echo -e " 查看节点信息: ${YELLOW}sb info${PLAIN}"
                 echo -e " 全局管理工具: ${YELLOW}sb${PLAIN}"
-                echo -e " 默认仅生成临时自签证书，请替换为正式证书后再对外提供服务。"
+                if [[ $ENABLE_VMESS -eq 1 ]]; then
+                    echo -e " 默认仅生成临时自签证书，请替换为正式证书后再对外提供服务。"
+                fi
                 echo -e "${GREEN}=================================================${PLAIN}"
             fi
             ;;
