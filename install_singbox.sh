@@ -553,6 +553,32 @@ view_inbound_info() {
         echo -e "----------------------------------------------------------------"
     fi
 
+    # 住宅 IP 出站
+    if jq -e 'any(.outbounds[]?; .tag == "residential-out")' "$CONFIG_FILE" >/dev/null 2>&1; then
+        local proxy_type proxy_server proxy_port proxy_user proxy_pass proxy_type_display
+        proxy_type=$(jq -r '.outbounds[] | select(.tag=="residential-out") | .type' "$CONFIG_FILE")
+        proxy_server=$(jq -r '.outbounds[] | select(.tag=="residential-out") | .server' "$CONFIG_FILE")
+        proxy_port=$(jq -r '.outbounds[] | select(.tag=="residential-out") | .server_port' "$CONFIG_FILE")
+        proxy_user=$(jq -r '.outbounds[] | select(.tag=="residential-out") | (.username // "")' "$CONFIG_FILE")
+        proxy_pass=$(jq -r '.outbounds[] | select(.tag=="residential-out") | (.password // "")' "$CONFIG_FILE")
+        if [[ "$proxy_type" == "http" ]]; then
+            proxy_type_display="HTTP"
+        else
+            proxy_type_display="SOCKS5"
+        fi
+
+        echo -e "${GREEN}【出站: 住宅 IP 代理（默认出站）】${PLAIN}"
+        echo -e "  类型:   ${CYAN}${proxy_type_display}${PLAIN}"
+        echo -e "  地址:   ${CYAN}${proxy_server}:${proxy_port}${PLAIN}"
+        if [[ -n "$proxy_user" ]]; then
+            echo -e "  用户名: ${CYAN}${proxy_user}${PLAIN}"
+            echo -e "  密码:   ${CYAN}${proxy_pass:-<空>}${PLAIN}"
+        else
+            echo -e "  认证:   ${CYAN}无${PLAIN}"
+        fi
+        echo -e "----------------------------------------------------------------"
+    fi
+
     if [[ -n "$ws_tag" ]]; then
         echo -e "${RED}证书目录检查:${PLAIN}"
         echo -e "  公钥证书: ${CERT_DIR}/fullchain.pem $([[ -f "${CERT_DIR}/fullchain.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
@@ -613,6 +639,87 @@ select_inbound_protocols() {
     return 0
 }
 
+# 解析 host:port 形式的代理地址，兼容 scheme 前缀与 IPv6 方括号
+parse_proxy_address() {
+    local input="$1"
+    input="${input#http://}"
+    input="${input#https://}"
+    input="${input#socks5h://}"
+    input="${input#socks5://}"
+    input="${input#socks://}"
+    input="${input%%/*}"
+
+    if [[ "$input" =~ ^\[(.+)\]:([0-9]+)$ ]]; then
+        PROXY_HOST="${BASH_REMATCH[1]}"
+        PROXY_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$input" =~ ^([^:]+):([0-9]+)$ ]]; then
+        PROXY_HOST="${BASH_REMATCH[1]}"
+        PROXY_PORT="${BASH_REMATCH[2]}"
+    else
+        return 1
+    fi
+
+    [[ -n "$PROXY_HOST" ]] || return 1
+    [[ "$PROXY_HOST" != *[[:space:]]* ]] || return 1
+    (( PROXY_PORT >= 1 && PROXY_PORT <= 65535 )) || return 1
+    return 0
+}
+
+# 配置住宅 IP 出站（可选）
+configure_residential_outbound() {
+    RESIDENTIAL_ENABLED=0
+    RESIDENTIAL_TYPE=""
+    RESIDENTIAL_HOST=""
+    RESIDENTIAL_PORT=""
+    RESIDENTIAL_USER=""
+    RESIDENTIAL_PASS=""
+
+    local use_proxy
+    read -rp "是否启用住宅 IP 出站（启用后默认流量从代理出站）？[y/N]: " use_proxy </dev/tty || return 0
+    if [[ ! "$use_proxy" =~ ^[Yy]([Ee][Ss])?$ ]]; then
+        echo -e "${YELLOW}未启用住宅 IP 出站，流量将直接出站。${PLAIN}"
+        return 0
+    fi
+
+    local type_choice
+    while true; do
+        echo -e "${CYAN}请选择住宅 IP 代理类型：${PLAIN}"
+        echo -e "  ${GREEN}1)${PLAIN} HTTP"
+        echo -e "  ${GREEN}2)${PLAIN} SOCKS5"
+        read -rp "请输入编号 [1-2]: " type_choice </dev/tty || return 0
+        type_choice=$(printf '%s' "$type_choice" | tr '[:upper:]' '[:lower:]')
+        case "$type_choice" in
+            1|http) RESIDENTIAL_TYPE="http"; break ;;
+            2|socks|socks5) RESIDENTIAL_TYPE="socks"; break ;;
+            *) echo -e "${RED}输入无效，请输入 1 或 2。${PLAIN}" ;;
+        esac
+    done
+
+    local address
+    while true; do
+        read -rp "请输入代理地址（host:port，例如 1.2.3.4:8080）: " address </dev/tty || return 0
+        if parse_proxy_address "$address"; then
+            RESIDENTIAL_HOST="$PROXY_HOST"
+            RESIDENTIAL_PORT="$PROXY_PORT"
+            break
+        fi
+        echo -e "${RED}地址格式无效，请使用 host:port 形式。${PLAIN}"
+    done
+
+    read -rp "代理用户名（可留空）: " RESIDENTIAL_USER </dev/tty || RESIDENTIAL_USER=""
+    if [[ -n "$RESIDENTIAL_USER" ]]; then
+        read -rsp "代理密码（可留空，输入不回显）: " RESIDENTIAL_PASS </dev/tty || RESIDENTIAL_PASS=""
+        echo
+    else
+        RESIDENTIAL_PASS=""
+    fi
+
+    RESIDENTIAL_ENABLED=1
+    local type_display="SOCKS5"
+    [[ "$RESIDENTIAL_TYPE" == "http" ]] && type_display="HTTP"
+    echo -e "${GREEN}已启用住宅 IP 出站：${type_display} ${RESIDENTIAL_HOST}:${RESIDENTIAL_PORT}${PLAIN}"
+}
+
 # 按用户选择的协议生成入站、嗅探与基础拦截规则的配置
 generate_production_config() {
     mkdir -p "$CONFIG_DIR"
@@ -623,6 +730,7 @@ generate_production_config() {
     echo -e "${CYAN}=================================================${PLAIN}"
 
     select_inbound_protocols || return 1
+    configure_residential_outbound
 
     local ws_domain=""
     if [[ $ENABLE_VMESS -eq 1 ]]; then
@@ -762,19 +870,40 @@ generate_production_config() {
             }]' <<<"$inbounds") || return 1
     fi
 
-    if ! jq -n --argjson inbounds "$inbounds" '{
+    # 出站：启用住宅 IP 时作为默认出站
+    local outbounds final_outbound="direct"
+    if [[ $RESIDENTIAL_ENABLED -eq 1 ]]; then
+        final_outbound="residential-out"
+        local has_auth=0
+        [[ -n "$RESIDENTIAL_USER" ]] && has_auth=1
+        outbounds=$(jq -cn \
+            --arg type "$RESIDENTIAL_TYPE" \
+            --arg server "$RESIDENTIAL_HOST" \
+            --argjson port "$RESIDENTIAL_PORT" \
+            --argjson auth "$has_auth" \
+            --arg username "$RESIDENTIAL_USER" \
+            --arg password "$RESIDENTIAL_PASS" \
+            '[({
+              "type": $type,
+              "tag": "residential-out",
+              "server": $server,
+              "server_port": $port
+            }
+            + (if $type == "socks" then {"version": "5"} else {} end)
+            + (if $auth == 1 then {"username": $username, "password": $password} else {} end)),
+            {"type": "direct", "tag": "direct"}]') || return 1
+    else
+        outbounds='[{"type":"direct","tag":"direct"}]'
+    fi
+
+    if ! jq -n --argjson inbounds "$inbounds" --argjson outbounds "$outbounds" --arg final "$final_outbound" '{
       "log": {
         "disabled": false,
         "level": "info",
         "timestamp": true
       },
       "inbounds": $inbounds,
-      "outbounds": [
-        {
-          "type": "direct",
-          "tag": "direct"
-        }
-      ],
+      "outbounds": $outbounds,
       "route": {
         "rules": [
           {
@@ -805,7 +934,7 @@ generate_production_config() {
             "download_detour": "direct"
           }
         ],
-        "final": "direct",
+        "final": $final,
         "auto_detect_interface": true
       }
     }' > "$CONFIG_FILE"; then

@@ -69,6 +69,23 @@ sing-box 同理，把文件名换成 `install_singbox.sh` 即可。
 - 仅选择 VMess-WS-TLS 时才需要域名和证书；只选 Shadowsocks / VLESS-Reality 时无需证书。
 - Shadowsocks 密码、Reality 密钥对和 Short ID 在每次重新生成配置时都会更新。
 
+## 住宅 IP 出站
+
+生成配置时还会询问是否启用住宅 IP 出站：
+
+1. 选择是否启用
+2. 选择代理类型：HTTP 或 SOCKS5
+3. 输入代理地址：`host:port`（兼容 `http://`、`socks5://` 前缀）
+4. 输入用户名和密码（**均可留空**，无认证代理直接回车）
+
+启用后：
+
+- 该代理作为默认出站，未被拦截规则命中的流量都从住宅 IP 出站
+- Xray 会额外把 53 端口 DNS 查询固定为直连，避免 DNS 走 HTTP/SOCKS 代理失败
+- sing-box 的 `route.final` 会指向该住宅代理
+- `xr info` / `sb info` 会显示当前住宅代理的类型、地址与认证信息
+- 重新执行 `xr gen` / `sb gen` 会重新询问并覆盖现有出站配置
+
 ## 服务管理
 
 安装完成后会部署管理命令，无参数运行进入交互菜单：
