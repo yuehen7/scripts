@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
 # Xray (v26.6.27) 一键安装、服务管理、BBR 调优与配置生成脚本
-# 入站: 可选 Shadowsocks(32443) / VLESS-Reality(443) / VMess-WS-TLS(2053)
+# 入站: 可选 Shadowsocks(默认32443) / VLESS-Reality(默认443) / VMess-WS-TLS(默认2053)
 # 支持 systemd (Debian/Ubuntu/CentOS 等) 与 OpenRC (Alpine 等)
 # =========================================================
 
@@ -41,6 +41,10 @@ SS_METHOD="2022-blake3-aes-128-gcm"
 REALITY_PORT=443
 VMESS_WS_PORT=2053
 VMESS_WS_PATH="/175443"
+# 默认端口（用户可在生成配置时自定义）
+DEFAULT_SS_PORT="$SS_PORT"
+DEFAULT_REALITY_PORT="$REALITY_PORT"
+DEFAULT_VMESS_WS_PORT="$VMESS_WS_PORT"
 # VLESS-Reality 与 VMess-WS-TLS 共用固定 UUID
 FIXED_UUID="8326d9fd-3246-4ca0-aa48-894f0e7d96d6"
 
@@ -612,9 +616,9 @@ select_inbound_protocols() {
     local input token
     while true; do
         echo -e "\n${CYAN}请选择要启用的入站协议（可多选，至少选择一个）：${PLAIN}"
-        echo -e "  ${GREEN}1)${PLAIN} Shadowsocks      ${YELLOW}端口 ${SS_PORT}，加密 ${SS_METHOD}${PLAIN}"
-        echo -e "  ${GREEN}2)${PLAIN} VLESS + Reality  ${YELLOW}端口 ${REALITY_PORT}${PLAIN}"
-        echo -e "  ${GREEN}3)${PLAIN} VMess + WS + TLS ${YELLOW}端口 ${VMESS_WS_PORT}${PLAIN}"
+        echo -e "  ${GREEN}1)${PLAIN} Shadowsocks      ${YELLOW}默认端口 ${DEFAULT_SS_PORT}，加密 ${SS_METHOD}${PLAIN}"
+        echo -e "  ${GREEN}2)${PLAIN} VLESS + Reality  ${YELLOW}默认端口 ${DEFAULT_REALITY_PORT}${PLAIN}"
+        echo -e "  ${GREEN}3)${PLAIN} VMess + WS + TLS ${YELLOW}默认端口 ${DEFAULT_VMESS_WS_PORT}${PLAIN}"
         read -rp "请输入编号（多个用空格或逗号分隔，输入 all 全选）: " input </dev/tty || return 1
         input=$(printf '%s' "$input" | tr ',' ' ')
 
@@ -640,14 +644,73 @@ select_inbound_protocols() {
         break
     done
 
-    [[ $ENABLE_SS -eq 1 ]] && SELECTED_PORTS+=("$SS_PORT")
-    [[ $ENABLE_REALITY -eq 1 ]] && SELECTED_PORTS+=("$REALITY_PORT")
-    [[ $ENABLE_VMESS -eq 1 ]] && SELECTED_PORTS+=("$VMESS_WS_PORT")
-
     echo -e "${GREEN}已选择入站协议：${PLAIN}"
-    [[ $ENABLE_SS -eq 1 ]] && echo -e "  - Shadowsocks (${SS_PORT})"
-    [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality (${REALITY_PORT})"
-    [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS (${VMESS_WS_PORT})"
+    [[ $ENABLE_SS -eq 1 ]] && echo -e "  - Shadowsocks"
+    [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality"
+    [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS"
+    return 0
+}
+
+# 端口是否已被本次选择使用
+port_in_selected() {
+    local p
+    for p in "${SELECTED_PORTS[@]}"; do
+        [[ "$p" == "$1" ]] && return 0
+    done
+    return 1
+}
+
+# 提示输入端口，直接回车返回默认值
+prompt_inbound_port() {
+    local name="$1" default_port="$2" input
+    while true; do
+        read -rp "${name} 端口 [默认 ${default_port}]（直接回车使用默认值）: " input </dev/tty || input=""
+        input=$(printf '%s' "$input" | tr -d '[:space:]')
+        if [[ -z "$input" ]]; then
+            if port_in_selected "$default_port"; then
+                echo -e "${RED}默认端口 ${default_port} 已被其他协议使用，请输入自定义端口。${PLAIN}" >&2
+                continue
+            fi
+            printf '%s\n' "$default_port"
+            return 0
+        fi
+        if [[ "$input" =~ ^[0-9]{1,5}$ ]] && (( 10#$input >= 1 && 10#$input <= 65535 )); then
+            input=$((10#$input))
+            if port_in_selected "$input"; then
+                echo -e "${RED}端口 ${input} 与已配置的协议重复，请更换。${PLAIN}" >&2
+                continue
+            fi
+            printf '%s\n' "$input"
+            return 0
+        fi
+        echo -e "${RED}端口无效，请输入 1-65535 之间的数字，或直接回车使用默认值。${PLAIN}" >&2
+    done
+}
+
+# 逐个配置已选协议的入站端口
+configure_inbound_ports() {
+    SS_PORT="$DEFAULT_SS_PORT"
+    REALITY_PORT="$DEFAULT_REALITY_PORT"
+    VMESS_WS_PORT="$DEFAULT_VMESS_WS_PORT"
+    SELECTED_PORTS=()
+
+    if [[ $ENABLE_SS -eq 1 ]]; then
+        SS_PORT=$(prompt_inbound_port "Shadowsocks" "$SS_PORT")
+        SELECTED_PORTS+=("$SS_PORT")
+    fi
+    if [[ $ENABLE_REALITY -eq 1 ]]; then
+        REALITY_PORT=$(prompt_inbound_port "VLESS + Reality" "$REALITY_PORT")
+        SELECTED_PORTS+=("$REALITY_PORT")
+    fi
+    if [[ $ENABLE_VMESS -eq 1 ]]; then
+        VMESS_WS_PORT=$(prompt_inbound_port "VMess + WS + TLS" "$VMESS_WS_PORT")
+        SELECTED_PORTS+=("$VMESS_WS_PORT")
+    fi
+
+    echo -e "${GREEN}入站端口：${PLAIN}"
+    [[ $ENABLE_SS -eq 1 ]] && echo -e "  - Shadowsocks: ${SS_PORT}"
+    [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality: ${REALITY_PORT}"
+    [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS: ${VMESS_WS_PORT}"
     return 0
 }
 
@@ -742,6 +805,7 @@ generate_production_config() {
     echo -e "${CYAN}=================================================${PLAIN}"
 
     select_inbound_protocols || return 1
+    configure_inbound_ports
     configure_residential_outbound
 
     local ws_domain=""
@@ -1076,7 +1140,10 @@ EOF
 show_start_failure() {
     echo -e "${RED}Xray 启动失败。以下是最近的日志：${PLAIN}"
     service_logs_recent
-    echo -e "${YELLOW}可依次执行：xr test、ss -ltnp | grep -E ':(${SS_PORT}|${REALITY_PORT}|${VMESS_WS_PORT})'、xr log${PLAIN}"
+    local port_regex
+    port_regex=$(jq -r '[.inbounds[]? | (.port // .listen_port)] | map(tostring) | join("|")' "$CONFIG_FILE" 2>/dev/null)
+    [[ -z "$port_regex" || "$port_regex" == "null" ]] && port_regex="${DEFAULT_SS_PORT}|${DEFAULT_REALITY_PORT}|${DEFAULT_VMESS_WS_PORT}"
+    echo -e "${YELLOW}可依次执行：xr test、ss -ltnp | grep -E ':(${port_regex})'、xr log${PLAIN}"
 }
 
 start_service() {
