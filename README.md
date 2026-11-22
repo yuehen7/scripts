@@ -67,6 +67,7 @@ sing-box / WARP 同理，把文件名换成 `install_singbox.sh` / `install_warp
 | 1 | Shadowsocks | 32443 | 加密方式 `2022-blake3-aes-128-gcm`，密码自动生成 |
 | 2 | VLESS + Reality | 443 | `xtls-rprx-vision`，自动测速选择伪装目标 |
 | 3 | VMess + WS + TLS | 2053 | WS 路径 `/175443`，支持 CDN 回源 |
+| 4 | Hysteria2 | 8443/UDP | QUIC，密码自动生成；仅 sing-box 支持，Xray 不支持 |
 
 输入方式：
 
@@ -82,8 +83,18 @@ sing-box / WARP 同理，把文件名换成 `install_singbox.sh` / `install_warp
 说明：
 
 - VLESS-Reality 与 VMess-WS-TLS 共用固定 UUID `8326d9fd-3246-4ca0-aa48-894f0e7d96d6`。
-- 仅选择 VMess-WS-TLS 时才需要域名和证书；只选 Shadowsocks / VLESS-Reality 时无需证书。
-- Shadowsocks 密码、Reality 密钥对和 Short ID 在每次重新生成配置时都会更新。
+- VMess-WS-TLS 与 Hysteria2 需要证书；只选 Shadowsocks / VLESS-Reality 时无需证书。
+- Shadowsocks 密码、Hysteria2 密码、Reality 密钥对和 Short ID 在每次重新生成配置时都会更新。
+- Hysteria2 使用 UDP，端口检查会分别检查 TCP 与 UDP；请确保本机防火墙和云安全组放行对应的 UDP 端口。
+- Hysteria2 不能通过 Cloudflare Argo 等仅支持 HTTP/WebSocket 的隧道转发。
+
+### Hysteria2
+
+Hysteria2 复用 `/etc/sing-box/cert/` 下的证书：
+
+- 使用脚本生成的临时自签证书时，`sb info` 会输出带 `insecure=1` 的链接，客户端需开启跳过证书校验（Mihomo 为 `skip-cert-verify: true`）。
+- 使用正式证书时，脚本会优先从证书 SAN/CN 中提取具体域名作为 SNI；如果只有通配符证书，会提示输入实际使用的子域名。`sb info` 输出的链接不包含 `insecure`。
+- 更换证书后建议重新执行 `sb gen`，让 SNI 与新证书重新匹配；如果证书域名没有变化，也可以只重新执行 `sb info`。
 
 ## 住宅 IP 出站
 
@@ -206,12 +217,12 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 `xr info` / `sb info` 会读取当前配置并输出：
 
 - 服务器地址、端口、UUID 或 Shadowsocks 密码
-- 分享链接：`vless://`、`vmess://`、`ss://`
+- 分享链接：`vless://`、`vmess://`、`ss://`、`hysteria2://`
 - Mihomo 可用的节点 JSON（添加到 `proxies` 数组）
 
 ## 证书
 
-启用 VMess-WS-TLS 时，证书需放置在：
+启用 VMess-WS-TLS 或 Hysteria2 时，证书需放置在：
 
 ```text
 /etc/xray/cert/fullchain.pem
@@ -221,9 +232,11 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 /etc/sing-box/cert/privkey.pem
 ```
 
+- VMess-WS-TLS 与 Hysteria2 共用同一份证书。
 - 若证书缺失，脚本会自动生成 1 年有效期的临时自签证书，仅用于让服务正常启动。
+- 使用临时自签证书时，Hysteria2 客户端必须开启跳过证书校验（`insecure=1` / `skip-cert-verify: true`）。
 - 对外提供服务前请替换为正式证书（如 Let's Encrypt）。
-- 只启用 Shadowsocks 或 VLESS-Reality 时不需要证书。
+- 只启用 Shadowsocks 或 VLESS-Reality 时不需要配置证书。
 
 ## 端口与防火墙
 
@@ -234,9 +247,12 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 | VLESS + Reality | 443 | TCP |
 | VMess + WS + TLS | 2053 | TCP |
 | Shadowsocks | 32443 | TCP + UDP |
+| Hysteria2 | 8443 | UDP |
 | WireProxy SOCKS5 | 安装时随机 / 自定义 | TCP |
 
 云服务器还需在安全组中放行相同端口。如果生成配置时自定义了端口，请以实际配置为准；`xr info` / `sb info` / `warp info` 会显示最终使用的端口。
+
+Hysteria2 是 UDP/QUIC 协议，除本机防火墙外，云安全组也必须放行对应的 **UDP** 端口。
 
 WireProxy 仅监听 `127.0.0.1` 时无需放行端口；监听 `0.0.0.0` 时需放行对应 TCP 端口，并建议启用 SOCKS5 用户名/密码认证、限制来源 IP。WARP 本身通过 UDP 连接 CloudFlare Endpoint（默认 2408），无需在服务器上放行入站 UDP。
 

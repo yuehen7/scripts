@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
 # sing-box 一键安装、服务管理、BBR 调优、配置生成与节点查看脚本
-# 入站: 可选 Shadowsocks(默认32443) / VLESS-Reality(默认443) / VMess-WS-TLS(默认2053)
+# 入站: 可选 Shadowsocks(默认32443) / VLESS-Reality(默认443) / VMess-WS-TLS(默认2053) / Hysteria2(默认8443 UDP)
 # 支持 systemd (Debian/Ubuntu/CentOS 等) 与 OpenRC (Alpine 等)
 # =========================================================
 
@@ -39,11 +39,13 @@ SS_PORT=32443
 SS_METHOD="2022-blake3-aes-128-gcm"
 REALITY_PORT=443
 VMESS_WS_PORT=2053
+HY2_PORT=8443
 VMESS_WS_PATH="/175443"
 # 默认端口（用户可在生成配置时自定义）
 DEFAULT_SS_PORT="$SS_PORT"
 DEFAULT_REALITY_PORT="$REALITY_PORT"
 DEFAULT_VMESS_WS_PORT="$VMESS_WS_PORT"
+DEFAULT_HY2_PORT="$HY2_PORT"
 # VLESS-Reality 与 VMess-WS-TLS 共用固定 UUID
 FIXED_UUID="8326d9fd-3246-4ca0-aa48-894f0e7d96d6"
 
@@ -226,15 +228,53 @@ check_certificate_files() {
     fi
 }
 
-# 检查端口是否已被其他进程监听
+# 从证书中提取可用于 Hysteria2 SNI 的域名（优先 SAN，其次 CN）
+get_cert_sni() {
+    local cert_file="${CERT_DIR}/fullchain.pem"
+    [[ -s "$cert_file" ]] || return 0
+
+    local san cn
+    # 跳过通配符 SAN，优先返回可直接作为 SNI 的具体域名
+    san=$(openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null \
+        | tr ',' '\n' | sed -n 's/.*DNS:[[:space:]]*\([^[:space:]]*\).*/\1/p' \
+        | grep -v '^\*\.' | head -n 1)
+    if [[ -n "$san" ]]; then
+        printf '%s\n' "$san"
+        return 0
+    fi
+
+    cn=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null \
+        | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p' | tr -d '\r')
+    if [[ -n "$cn" && "$cn" != "temporary.cert" && "$cn" != \*.* ]]; then
+        printf '%s\n' "$cn"
+    fi
+}
+
+# 判断当前证书是否为自签证书（自签时客户端需要跳过证书校验）
+is_self_signed_cert() {
+    local cert_file="${CERT_DIR}/fullchain.pem"
+    [[ -s "$cert_file" ]] || return 1
+
+    local subject issuer
+    subject=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/^subject=//')
+    issuer=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/^issuer=//')
+    [[ -n "$subject" && "$subject" == "$issuer" ]]
+}
+
+# 检查端口是否已被其他进程监听（支持 tcp / udp）
 check_port_available() {
     local port="$1"
+    local proto="${2:-tcp}"
     command -v ss >/dev/null 2>&1 || return 0
 
     local listeners
-    listeners=$(ss -H -ltn 2>/dev/null | awk -v port="$port" '$4 ~ (":" port "$") { print }')
+    if [[ "$proto" == "udp" ]]; then
+        listeners=$(ss -H -lun 2>/dev/null | awk -v port="$port" '$4 ~ (":" port "$") { print }')
+    else
+        listeners=$(ss -H -ltn 2>/dev/null | awk -v port="$port" '$4 ~ (":" port "$") { print }')
+    fi
     if [[ -n "$listeners" ]]; then
-        echo -e "${RED}端口 ${port} 已被其他进程监听，sing-box 无法启动：${PLAIN}"
+        echo -e "${RED}端口 ${port}/${proto} 已被其他进程监听，sing-box 无法启动：${PLAIN}"
         echo "$listeners"
         return 1
     fi
@@ -407,12 +447,16 @@ view_inbound_info() {
     local ss_tag
     ss_tag=$(jq -r '.inbounds[] | select(.tag=="shadowsocks-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
 
+    # 解析 Hysteria2 入站
+    local hy2_tag
+    hy2_tag=$(jq -r '.inbounds[] | select(.tag=="hysteria2-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+
     if jq -e 'any(.inbounds[]?; .tag == "vless-ws-tls-in")' "$CONFIG_FILE" >/dev/null 2>&1; then
         echo -e "${YELLOW}提示: 检测到旧版 VLESS-WS-TLS 入站，当前版本已改为 VMess-WS-TLS。${PLAIN}"
         echo -e "${YELLOW}      执行 'sb gen' 可重新选择并生成入站配置。${PLAIN}"
     fi
 
-    if [[ -z "$ss_tag" && -z "$r_tag" && -z "$ws_tag" ]]; then
+    if [[ -z "$ss_tag" && -z "$r_tag" && -z "$ws_tag" && -z "$hy2_tag" ]]; then
         echo -e "${RED}未找到可识别的入站配置，请执行 'sb gen' 重新生成。${PLAIN}"
         return 1
     fi
@@ -557,6 +601,59 @@ view_inbound_info() {
         echo -e "----------------------------------------------------------------"
     fi
 
+    if [[ -n "$hy2_tag" ]]; then
+        local hy2_port hy2_password hy2_sni hy2_insecure=0
+        hy2_port=$(jq -r '.inbounds[] | select(.tag=="hysteria2-in") | .listen_port' "$CONFIG_FILE")
+        hy2_password=$(jq -r '.inbounds[] | select(.tag=="hysteria2-in") | .users[0].password' "$CONFIG_FILE")
+
+        hy2_sni=$(jq -r '.inbounds[] | select(.tag=="hysteria2-in") | (.tls.server_name // "")' "$CONFIG_FILE")
+        if [[ -z "$hy2_sni" ]]; then
+            # 兼容旧配置：未写入 server_name 时从证书中推断
+            hy2_sni=$(get_cert_sni)
+            if [[ -z "$hy2_sni" ]]; then
+                hy2_sni="www.bing.com"
+                hy2_insecure=1
+            fi
+        fi
+        if [[ ! -s "${CERT_DIR}/fullchain.pem" ]] || is_self_signed_cert; then
+            hy2_insecure=1
+        fi
+
+        echo -e "${GREEN}【协议: Hysteria2 (QUIC / UDP)】${PLAIN}"
+        echo -e "  地址 (Address):     ${CYAN}${server_ip}${PLAIN}"
+        echo -e "  端口 (Port):        ${CYAN}${hy2_port}${PLAIN} (UDP)"
+        echo -e "  密码 (Password):    ${CYAN}${hy2_password}${PLAIN}"
+        echo -e "  SNI:                ${CYAN}${hy2_sni}${PLAIN}"
+        if [[ $hy2_insecure -eq 1 ]]; then
+            echo -e "  证书校验:           ${YELLOW}跳过（自签证书，客户端需 insecure / skip-cert-verify）${PLAIN}"
+        fi
+        echo -e "  提示:               请确认本机防火墙与云安全组已放行 ${hy2_port}/udp"
+
+        local hy2_link="hysteria2://${hy2_password}@${server_ip}:${hy2_port}/?sni=${hy2_sni}"
+        [[ $hy2_insecure -eq 1 ]] && hy2_link+="&insecure=1"
+        hy2_link+="#sing-box-Hysteria2"
+        echo -e "  分享链接 (Link):"
+        echo -e "  ${YELLOW}${hy2_link}${PLAIN}"
+        echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
+        jq -n \
+            --arg name "sing-box-Hysteria2" \
+            --arg server "$server_ip" \
+            --argjson port "$hy2_port" \
+            --arg password "$hy2_password" \
+            --arg sni "$hy2_sni" \
+            --argjson insecure "$hy2_insecure" \
+            '{
+              name: $name,
+              type: "hysteria2",
+              server: $server,
+              port: $port,
+              password: $password,
+              sni: $sni,
+              alpn: ["h3"]
+            } + (if $insecure == 1 then {"skip-cert-verify": true} else {} end)'
+        echo -e "----------------------------------------------------------------"
+    fi
+
     # 住宅 IP 出站
     if jq -e 'any(.outbounds[]?; .tag == "residential-out")' "$CONFIG_FILE" >/dev/null 2>&1; then
         local proxy_type proxy_server proxy_port proxy_user proxy_pass proxy_type_display
@@ -583,7 +680,7 @@ view_inbound_info() {
         echo -e "----------------------------------------------------------------"
     fi
 
-    if [[ -n "$ws_tag" ]]; then
+    if [[ -n "$ws_tag" || -n "$hy2_tag" ]]; then
         echo -e "${RED}证书目录检查:${PLAIN}"
         echo -e "  公钥证书: ${CERT_DIR}/fullchain.pem $([[ -f "${CERT_DIR}/fullchain.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
         echo -e "  私钥证书: ${CERT_DIR}/privkey.pem   $([[ -f "${CERT_DIR}/privkey.pem" ]] && echo -e "${GREEN}[已存在]${PLAIN}" || echo -e "${RED}[缺失]${PLAIN}")"
@@ -599,6 +696,7 @@ select_inbound_protocols() {
     ENABLE_SS=0
     ENABLE_REALITY=0
     ENABLE_VMESS=0
+    ENABLE_HY2=0
     SELECTED_PORTS=()
 
     local input token
@@ -607,28 +705,31 @@ select_inbound_protocols() {
         echo -e "  ${GREEN}1)${PLAIN} Shadowsocks      ${YELLOW}默认端口 ${DEFAULT_SS_PORT}，加密 ${SS_METHOD}${PLAIN}"
         echo -e "  ${GREEN}2)${PLAIN} VLESS + Reality  ${YELLOW}默认端口 ${DEFAULT_REALITY_PORT}${PLAIN}"
         echo -e "  ${GREEN}3)${PLAIN} VMess + WS + TLS ${YELLOW}默认端口 ${DEFAULT_VMESS_WS_PORT}${PLAIN}"
+        echo -e "  ${GREEN}4)${PLAIN} Hysteria2        ${YELLOW}默认端口 ${DEFAULT_HY2_PORT} (UDP)，QUIC${PLAIN}"
         read -rp "请输入编号（多个用空格或逗号分隔，输入 all 全选）: " input </dev/tty || return 1
         input=$(printf '%s' "$input" | tr ',' ' ')
 
-        local ss=0 reality=0 vmess=0 invalid=0
+        local ss=0 reality=0 vmess=0 hy2=0 invalid=0
         for token in $input; do
             case "$token" in
                 1) ss=1 ;;
                 2) reality=1 ;;
                 3) vmess=1 ;;
-                all|ALL|All) ss=1; reality=1; vmess=1 ;;
+                4) hy2=1 ;;
+                all|ALL|All) ss=1; reality=1; vmess=1; hy2=1 ;;
                 *) invalid=1 ;;
             esac
         done
 
-        if [[ $invalid -eq 1 || $((ss + reality + vmess)) -eq 0 ]]; then
-            echo -e "${RED}输入无效，请输入 1、2、3 的组合（如 1,3），或输入 all。${PLAIN}"
+        if [[ $invalid -eq 1 || $((ss + reality + vmess + hy2)) -eq 0 ]]; then
+            echo -e "${RED}输入无效，请输入 1、2、3、4 的组合（如 1,3），或输入 all。${PLAIN}"
             continue
         fi
 
         ENABLE_SS=$ss
         ENABLE_REALITY=$reality
         ENABLE_VMESS=$vmess
+        ENABLE_HY2=$hy2
         break
     done
 
@@ -636,6 +737,7 @@ select_inbound_protocols() {
     [[ $ENABLE_SS -eq 1 ]] && echo -e "  - Shadowsocks"
     [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality"
     [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS"
+    [[ $ENABLE_HY2 -eq 1 ]] && echo -e "  - Hysteria2"
     return 0
 }
 
@@ -680,6 +782,7 @@ configure_inbound_ports() {
     SS_PORT="$DEFAULT_SS_PORT"
     REALITY_PORT="$DEFAULT_REALITY_PORT"
     VMESS_WS_PORT="$DEFAULT_VMESS_WS_PORT"
+    HY2_PORT="$DEFAULT_HY2_PORT"
     SELECTED_PORTS=()
 
     if [[ $ENABLE_SS -eq 1 ]]; then
@@ -694,11 +797,16 @@ configure_inbound_ports() {
         VMESS_WS_PORT=$(prompt_inbound_port "VMess + WS + TLS" "$VMESS_WS_PORT")
         SELECTED_PORTS+=("$VMESS_WS_PORT")
     fi
+    if [[ $ENABLE_HY2 -eq 1 ]]; then
+        HY2_PORT=$(prompt_inbound_port "Hysteria2 (UDP)" "$HY2_PORT")
+        SELECTED_PORTS+=("$HY2_PORT")
+    fi
 
     echo -e "${GREEN}入站端口：${PLAIN}"
     [[ $ENABLE_SS -eq 1 ]] && echo -e "  - Shadowsocks: ${SS_PORT}"
     [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality: ${REALITY_PORT}"
     [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS: ${VMESS_WS_PORT}"
+    [[ $ENABLE_HY2 -eq 1 ]] && echo -e "  - Hysteria2: ${HY2_PORT} (UDP)"
     return 0
 }
 
@@ -797,8 +905,11 @@ generate_production_config() {
     configure_residential_outbound
 
     local ws_domain=""
-    if [[ $ENABLE_VMESS -eq 1 ]]; then
+    if [[ $ENABLE_VMESS -eq 1 || $ENABLE_HY2 -eq 1 ]]; then
         ensure_dummy_cert || return 1
+    fi
+
+    if [[ $ENABLE_VMESS -eq 1 ]]; then
         while [[ -z "$ws_domain" ]]; do
             read -rp "请输入 VMess-WS-TLS 入站绑定的域名 (例如: node.yourdomain.com): " ws_domain </dev/tty
             ws_domain=$(echo "$ws_domain" | tr -d '[:space:]')
@@ -809,6 +920,36 @@ generate_production_config() {
                 ws_domain=""
             fi
         done
+    fi
+
+    local hy2_sni=""
+    if [[ $ENABLE_HY2 -eq 1 ]]; then
+        if [[ $ENABLE_VMESS -eq 1 && -n "$ws_domain" ]]; then
+            # 与 VMess-WS-TLS 共用证书时，沿用用户输入的域名作为 SNI
+            hy2_sni="$ws_domain"
+        else
+            hy2_sni=$(get_cert_sni)
+            if [[ -z "$hy2_sni" ]]; then
+                if is_self_signed_cert; then
+                    hy2_sni="www.bing.com"
+                else
+                    while true; do
+                        read -rp "请输入 Hysteria2 客户端使用的 SNI/证书域名: " hy2_sni </dev/tty || return 1
+                        hy2_sni=$(printf '%s' "$hy2_sni" | tr -d '[:space:]')
+                        hy2_sni=${hy2_sni%.}
+                        hy2_sni=${hy2_sni,,}
+                        if validate_domain "$hy2_sni"; then
+                            break
+                        fi
+                        echo -e "${RED}域名格式无效，请输入完整域名，例如 node.example.com。${PLAIN}"
+                    done
+                fi
+            fi
+        fi
+        echo -e "${GREEN}Hysteria2 SNI: ${hy2_sni}${PLAIN}"
+        if is_self_signed_cert; then
+            echo -e "${YELLOW}提示: 当前使用自签证书，Hysteria2 客户端需要开启跳过证书校验 (insecure / skip-cert-verify)。${PLAIN}"
+        fi
     fi
 
     # VLESS 与 VMess 共用固定 UUID
@@ -846,6 +987,12 @@ generate_production_config() {
         ss_password=$(openssl rand -base64 16 | tr -d '\n')
     fi
 
+    local hy2_password=""
+    if [[ $ENABLE_HY2 -eq 1 ]]; then
+        # 使用十六进制，避免 URI 中出现需要转义的字符
+        hy2_password=$(openssl rand -hex 16)
+    fi
+
     local inbounds='[]'
 
     if [[ $ENABLE_SS -eq 1 ]]; then
@@ -859,8 +1006,7 @@ generate_production_config() {
               "listen": "::",
               "listen_port": $port,
               "method": $method,
-              "password": $password,
-              "network": "tcp,udp"
+              "password": $password
             }]' <<<"$inbounds") || return 1
     fi
 
@@ -930,6 +1076,33 @@ generate_production_config() {
                 "path": $path,
                 "max_early_data": 2048,
                 "early_data_header_name": "Sec-WebSocket-Protocol"
+              }
+            }]' <<<"$inbounds") || return 1
+    fi
+
+    if [[ $ENABLE_HY2 -eq 1 ]]; then
+        inbounds=$(jq -c \
+            --argjson port "$HY2_PORT" \
+            --arg password "$hy2_password" \
+            --arg sni "$hy2_sni" \
+            --arg cert "${CERT_DIR}/fullchain.pem" \
+            --arg key "${CERT_DIR}/privkey.pem" \
+            '. + [{
+              "type": "hysteria2",
+              "tag": "hysteria2-in",
+              "listen": "::",
+              "listen_port": $port,
+              "users": [
+                {
+                  "password": $password
+                }
+              ],
+              "tls": {
+                "enabled": true,
+                "server_name": $sni,
+                "alpn": ["h3"],
+                "certificate_path": $cert,
+                "key_path": $key
               }
             }]' <<<"$inbounds") || return 1
     fi
@@ -1089,8 +1262,8 @@ show_start_failure() {
     service_logs_recent
     local port_regex
     port_regex=$(jq -r '[.inbounds[]? | (.port // .listen_port)] | map(tostring) | join("|")' "$CONFIG_FILE" 2>/dev/null)
-    [[ -z "$port_regex" || "$port_regex" == "null" ]] && port_regex="${DEFAULT_SS_PORT}|${DEFAULT_REALITY_PORT}|${DEFAULT_VMESS_WS_PORT}"
-    echo -e "${YELLOW}可依次执行：sb test、ss -ltnp | grep -E ':(${port_regex})'、sb log 进行排查。${PLAIN}"
+    [[ -z "$port_regex" || "$port_regex" == "null" ]] && port_regex="${DEFAULT_SS_PORT}|${DEFAULT_REALITY_PORT}|${DEFAULT_VMESS_WS_PORT}|${DEFAULT_HY2_PORT}"
+    echo -e "${YELLOW}可依次执行：sb test、ss -lntup | grep -E ':(${port_regex})'、sb log 进行排查。${PLAIN}"
 }
 
 # 服务控制函数
@@ -1143,8 +1316,8 @@ test_config() {
         echo -e "${RED}未找到配置文件：${CONFIG_FILE}${PLAIN}"
         return 1
     fi
-    # 仅在启用 VMess-WS-TLS 入站时才校验证书文件
-    if jq -e 'any(.inbounds[]?; .tag == "vmess-ws-tls-in")' "$CONFIG_FILE" >/dev/null 2>&1; then
+    # 仅在启用需要证书的入站（VMess-WS-TLS / Hysteria2）时才校验证书文件
+    if jq -e 'any(.inbounds[]?; (.tag == "vmess-ws-tls-in") or (.tag == "hysteria2-in"))' "$CONFIG_FILE" >/dev/null 2>&1; then
         check_certificate_files || return 1
     fi
     echo -e "${YELLOW}正在检查 sing-box 配置...${PLAIN}"
@@ -1328,10 +1501,20 @@ main() {
                 download_singbox
                 generate_production_config || exit 1
 
-                # 仅检查用户实际选择的入站端口
-                for port in "${SELECTED_PORTS[@]}"; do
-                    check_port_available "$port" || exit 1
-                done
+                # 仅检查用户实际选择的入站端口（Shadowsocks 同时使用 TCP/UDP，Hysteria2 使用 UDP）
+                if [[ $ENABLE_SS -eq 1 ]]; then
+                    check_port_available "$SS_PORT" tcp || exit 1
+                    check_port_available "$SS_PORT" udp || exit 1
+                fi
+                if [[ $ENABLE_REALITY -eq 1 ]]; then
+                    check_port_available "$REALITY_PORT" tcp || exit 1
+                fi
+                if [[ $ENABLE_VMESS -eq 1 ]]; then
+                    check_port_available "$VMESS_WS_PORT" tcp || exit 1
+                fi
+                if [[ $ENABLE_HY2 -eq 1 ]]; then
+                    check_port_available "$HY2_PORT" udp || exit 1
+                fi
 
                 setup_service
                 install_cli
@@ -1347,8 +1530,8 @@ main() {
                 echo -e " 证书目录: ${CERT_DIR}/"
                 echo -e " 查看节点信息: ${YELLOW}sb info${PLAIN}"
                 echo -e " 全局管理工具: ${YELLOW}sb${PLAIN}"
-                if [[ $ENABLE_VMESS -eq 1 ]]; then
-                    echo -e " 默认仅生成临时自签证书，请替换为正式证书后再对外提供服务。"
+                if [[ $ENABLE_VMESS -eq 1 || $ENABLE_HY2 -eq 1 ]] && is_self_signed_cert; then
+                    echo -e " 当前使用自签证书，请替换为正式证书后再对外提供服务。"
                 fi
                 echo -e "${GREEN}=================================================${PLAIN}"
             fi
