@@ -15,6 +15,7 @@
 - 需要 bash 4+（Alpine 需先手动安装 bash，见下文）
 - 支持架构：x86_64、arm64、armv7、s390x、riscv64
 - 依赖：`curl`、`wget`、`jq`、`openssl`、`tar`/`unzip`、`iproute2`（脚本会自动安装；bash 必须预先存在）
+- Argo 隧道模式会额外下载 `cloudflared`（支持 Linux amd64 / arm64 / armv7 / i386），不依赖系统软件包
 
 > WireProxy-WARP 由 wgcf 注册账户，wgcf 官方仅提供 x86_64、arm64、armv7、386、s390x 二进制，暂不支持 riscv64。WARP 使用 UDP 出站，服务器需能访问 CloudFlare 的 WARP Endpoint（默认 2408 端口）。
 
@@ -32,7 +33,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install
 bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_singbox.sh)
 ```
 
-Xray / sing-box 安装流程：安装依赖 → 应用 BBR/网络优化 → 下载内核 → **交互选择入站协议** → 生成配置 → 注册服务（systemd/OpenRC）→ 启动。
+Xray / sing-box 安装流程：安装依赖 → 应用 BBR/网络优化 → 下载内核 → **交互选择入站协议** → 生成配置 → 注册服务（systemd/OpenRC）→ 启动。选择 Argo 隧道时会额外下载 `cloudflared` 并注册 `cloudflared-argo` 服务。
 
 ### WireProxy-WARP
 
@@ -62,12 +63,13 @@ sing-box / WARP 同理，把文件名换成 `install_singbox.sh` / `install_warp
 
 生成配置时会提示选择要启用的协议，可多选，**至少选择一个**：
 
-| 编号 | 协议 | 默认端口 | 说明 |
-| --- | --- | --- | --- |
-| 1 | Shadowsocks | 32443 | 加密方式 `2022-blake3-aes-128-gcm`，密码自动生成 |
-| 2 | VLESS + Reality | 443 | `xtls-rprx-vision`，自动测速选择伪装目标 |
-| 3 | VMess + WS + TLS | 2053 | WS 路径 `/175443`，支持 CDN 回源 |
-| 4 | Hysteria2 | 8443/UDP | QUIC，密码自动生成；仅 sing-box 支持，Xray 不支持 |
+| 编号 | 脚本 | 协议 | 默认端口 | 说明 |
+| --- | --- | --- | --- | --- |
+| 1 | Xray / sing-box | Shadowsocks | 32443 | 加密方式 `2022-blake3-aes-128-gcm`，密码自动生成 |
+| 2 | Xray / sing-box | VLESS + Reality | 443 | `xtls-rprx-vision`，自动测速选择伪装目标 |
+| 3 | Xray / sing-box | VMess + WS + TLS | 2053 | WS 路径 `/175443`，支持 CDN 回源 |
+| 4 | sing-box | Hysteria2 | 8443/UDP | QUIC，密码自动生成 |
+| 4 | Xray | Argo 隧道 | 本地 WS 2083 | 明文 VMess-WS + 外部 cloudflared，支持 quick / named |
 
 输入方式：
 
@@ -82,11 +84,12 @@ sing-box / WARP 同理，把文件名换成 `install_singbox.sh` / `install_warp
 
 说明：
 
-- VLESS-Reality 与 VMess-WS-TLS 共用固定 UUID `8326d9fd-3246-4ca0-aa48-894f0e7d96d6`。
+- VLESS-Reality 与 VMess-WS-TLS 共用固定 UUID `8326d9fd-3246-4ca0-aa48-894f0e7d96d6`；Xray 的 Argo 明文 VMess-WS 入站也复用该 UUID。
 - VMess-WS-TLS 与 Hysteria2 需要证书；只选 Shadowsocks / VLESS-Reality 时无需证书。
 - Shadowsocks 密码、Hysteria2 密码、Reality 密钥对和 Short ID 在每次重新生成配置时都会更新。
 - Hysteria2 使用 UDP，端口检查会分别检查 TCP 与 UDP；请确保本机防火墙和云安全组放行对应的 UDP 端口。
 - Hysteria2 不能通过 Cloudflare Argo 等仅支持 HTTP/WebSocket 的隧道转发。
+- Xray 的第 4 项是 Argo 隧道，会新增一个仅监听 `127.0.0.1` 的明文 VMess-WS 入站；详细配置见下文。
 
 ### Hysteria2
 
@@ -95,6 +98,41 @@ Hysteria2 复用 `/etc/sing-box/cert/` 下的证书：
 - 使用脚本生成的临时自签证书时，`sb info` 会输出带 `insecure=1` 的链接，客户端需开启跳过证书校验（Mihomo 为 `skip-cert-verify: true`）。
 - 使用正式证书时，脚本会优先从证书 SAN/CN 中提取具体域名作为 SNI；如果只有通配符证书，会提示输入实际使用的子域名。`sb info` 输出的链接不包含 `insecure`。
 - 更换证书后建议重新执行 `sb gen`，让 SNI 与新证书重新匹配；如果证书域名没有变化，也可以只重新执行 `sb info`。
+
+### Xray Argo 隧道
+
+Xray 的第 4 项会在本机启动一个仅监听 `127.0.0.1` 的明文 VMess-WS 入站，再由外部 `cloudflared` 通过 Cloudflare Argo 隧道对外提供服务。支持两种模式：
+
+- **quick**：使用随机 `*.trycloudflare.com` 域名，无需 Cloudflare 账号；cloudflared 每次重启后域名都会变化。
+- **named**：使用 Cloudflare Zero Trust 的 Tunnel Token，域名固定；需要在 Cloudflare 面板把 Public Hostname 指向 `http://127.0.0.1:<本地 WS 端口>`。
+
+配置流程会询问：
+
+1. Argo 模式（quick / named）
+2. cloudflared 连接 Cloudflare 边缘使用 IPv4 还是 IPv6
+3. named 模式额外询问 Tunnel Token 和公开域名
+
+安装后管理：
+
+```shell
+xr argo            # 交互菜单
+xr argo status     # 查看模式、域名、服务状态
+xr argo info       # 查看 Argo 节点链接
+xr argo restart    # 重启隧道（quick 模式会生成新域名）
+xr argo log        # 查看 cloudflared 日志
+xr argo update     # 更新 cloudflared
+xr argo uninstall  # 仅卸载 Argo
+```
+
+说明：
+
+- cloudflared 路径：`/usr/local/bin/cloudflared-argo`
+- 服务名：`cloudflared-argo`，日志：`/var/log/cloudflared-argo.log`
+- 支持架构：x86_64、arm64、armv7、i386；不支持 s390x / riscv64
+- Argo 只代理 HTTP/WebSocket/TCP，不能转发 Hysteria2 等 UDP 协议
+- 服务器不需要放行 Argo 入站端口，但需要能出站访问 Cloudflare
+- named 模式的 Token 保存在 `/etc/xray/argo/token`（权限 `600`）
+- 修改 Argo 模式或端口后执行 `xr gen`，再执行 `xr restart` 使配置生效
 
 ## 住宅 IP 出站
 
@@ -198,7 +236,10 @@ warp        # WireProxy-WARP 交互菜单
 | `gen` | ✅ | ✅ | 重新选择协议并生成配置 |
 | `bbr` | ✅ | ✅ | 查看/重新应用 BBR 优化 |
 | `update` | ❌ | ✅ | 更新 sing-box 内核 |
+| `argo` | ✅ | ❌ | 管理 Xray 的 Argo 隧道（status/info/start/stop/restart/log/update/uninstall） |
 | `uninstall` | ✅ | ✅ | 卸载脚本与内核 |
+
+Xray 启用 Argo 后，`xr start` / `xr stop` / `xr restart` / `xr status` 会同时管理 Xray 和 cloudflared；也可以使用 `xr argo` 单独管理隧道。
 
 示例：
 
@@ -217,8 +258,9 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 `xr info` / `sb info` 会读取当前配置并输出：
 
 - 服务器地址、端口、UUID 或 Shadowsocks 密码
-- 分享链接：`vless://`、`vmess://`、`ss://`、`hysteria2://`
+- 分享链接：`vless://`、`vmess://`（含 Argo）、`ss://`、`hysteria2://`
 - Mihomo 可用的节点 JSON（添加到 `proxies` 数组）
+- 启用 Argo 时，`xr info` 会输出当前 quick 域名或 named 固定域名对应的 `vmess://` 链接
 
 ## 证书
 
@@ -237,6 +279,7 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 - 使用临时自签证书时，Hysteria2 客户端必须开启跳过证书校验（`insecure=1` / `skip-cert-verify: true`）。
 - 对外提供服务前请替换为正式证书（如 Let's Encrypt）。
 - 只启用 Shadowsocks 或 VLESS-Reality 时不需要配置证书。
+- Argo 隧道的本地 VMess-WS 入站是明文 HTTP，不需要 Xray 侧证书；客户端到 Cloudflare 边缘的 TLS 由 Cloudflare 提供。
 
 ## 端口与防火墙
 
@@ -248,11 +291,14 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 | VMess + WS + TLS | 2053 | TCP |
 | Shadowsocks | 32443 | TCP + UDP |
 | Hysteria2 | 8443 | UDP |
+| Argo 本地 VMess-WS | 2083 | TCP（仅 `127.0.0.1`） |
 | WireProxy SOCKS5 | 安装时随机 / 自定义 | TCP |
 
 云服务器还需在安全组中放行相同端口。如果生成配置时自定义了端口，请以实际配置为准；`xr info` / `sb info` / `warp info` 会显示最终使用的端口。
 
 Hysteria2 是 UDP/QUIC 协议，除本机防火墙外，云安全组也必须放行对应的 **UDP** 端口。
+
+Argo 本地 VMess-WS 仅监听 `127.0.0.1`，无需放行；对外流量由 cloudflared 主动出站连接 Cloudflare 边缘。
 
 WireProxy 仅监听 `127.0.0.1` 时无需放行端口；监听 `0.0.0.0` 时需放行对应 TCP 端口，并建议启用 SOCKS5 用户名/密码认证、限制来源 IP。WARP 本身通过 UDP 连接 CloudFlare Endpoint（默认 2408），无需在服务器上放行入站 UDP。
 
@@ -271,10 +317,12 @@ WireProxy 仅监听 `127.0.0.1` 时无需放行端口；监听 `0.0.0.0` 时需�
 ## 更新与卸载
 
 ```shell
-sb update        # 更新 sing-box 到最新版
-xr uninstall     # 卸载 Xray
-sb uninstall     # 卸载 sing-box
-warp uninstall   # 卸载 WireProxy-WARP
+sb update          # 更新 sing-box 到最新版
+xr argo update     # 更新 Xray 使用的 cloudflared
+xr uninstall       # 卸载 Xray（同时清理 Argo 服务与 cloudflared）
+xr argo uninstall  # 仅卸载 Argo 隧道
+sb uninstall       # 卸载 sing-box
+warp uninstall     # 卸载 WireProxy-WARP
 ```
 
 重新执行 `install_warp.sh` 时会提示是否保留现有 WARP 账户和端口设置，选择保留即可只更新 WireProxy / wgcf 程序。
