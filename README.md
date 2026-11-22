@@ -140,7 +140,29 @@ WireProxy 是一个用户态 WireGuard 客户端，可以把 WARP 暴露为 SOCK
 | `warp reg` | 仅重新注册 WARP 账户 |
 | `warp plus` | 绑定 WARP+ 许可证 |
 | `warp port` | 修改 SOCKS5 端口 |
+| `warp stack` | 设置域名出口优先级（auto / v4 / v6） |
 | `warp info` | 查看 SOCKS5 地址、出口 IP 与 WARP 状态 |
+
+### IPv4 / IPv6 出口优先级
+
+需要区分两层：
+
+- **Endpoint 传输**：`warp ip` / `warp endpoint` 会先检测 IPv4 连通性；IPv4 可用时使用 IPv4 Endpoint，否则使用 IPv6 Endpoint。
+- **代理出口**：配置同时启用 IPv4/IPv6（`AllowedIPs = 0.0.0.0/0, ::/0`）。访问 IP 字面量时按字面量协议走；访问域名时由 WireProxy 的 `ResolveStrategy` 决定：
+  - `auto`（默认）：双栈时优先 IPv6
+  - `ipv4`：优先 IPv4
+  - `ipv6`：优先 IPv6
+
+切换方式：
+
+```shell
+warp stack        # 交互选择
+warp stack v4     # 优先 IPv4
+warp stack v6     # 优先 IPv6
+warp stack auto   # 恢复自动
+```
+
+优先级会写入 `/etc/wireproxy/wireproxy.conf` 的 `[Resolve] ResolveStrategy`，切换后自动重启并验证；`warp info` 会显示当前策略。
 
 ## 服务管理
 
@@ -175,7 +197,7 @@ sb restart
 warp ip
 ```
 
-WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`status`、`log`、`info`、`check`、`test`、`edit`、`uninstall`，以及专用的 `ip`、`endpoint`、`port`、`reg`、`plus` 子命令。
+WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`status`、`log`、`info`、`check`、`test`、`edit`、`uninstall`，以及专用的 `ip`、`endpoint`、`port`、`stack`、`reg`、`plus` 子命令。
 
 > `xr gen` / `sb gen` 会覆盖现有 `config.json`，并重新生成 Shadowsocks 密码、Reality 密钥和 Short ID，执行后需同步更新客户端节点。
 

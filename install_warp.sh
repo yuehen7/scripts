@@ -43,6 +43,8 @@ SERVICE_LOG="/var/log/${SERVICE_NAME}.log"
 
 DEFAULT_ENDPOINT="engage.cloudflareclient.com:2408"
 DEFAULT_MTU="1280"
+# 域名解析出口优先级：auto / ipv4 / ipv6
+DEFAULT_RESOLVE_STRATEGY="auto"
 
 # WireProxy 下载失败时使用的兜底版本
 WIREPROXY_FALLBACK_TAGS=("v1.1.3" "v1.1.2")
@@ -55,6 +57,7 @@ SOCKS_USER=""
 SOCKS_PASS=""
 WARP_ENDPOINT="$DEFAULT_ENDPOINT"
 WARP_MTU="$DEFAULT_MTU"
+RESOLVE_STRATEGY="$DEFAULT_RESOLVE_STRATEGY"
 
 set -o pipefail
 
@@ -332,6 +335,7 @@ load_settings() {
     SOCKS_PASS="${SOCKS_PASS:-}"
     WARP_ENDPOINT="${WARP_ENDPOINT:-$DEFAULT_ENDPOINT}"
     WARP_MTU="${WARP_MTU:-$DEFAULT_MTU}"
+    RESOLVE_STRATEGY="${RESOLVE_STRATEGY:-$DEFAULT_RESOLVE_STRATEGY}"
 }
 
 save_settings() {
@@ -343,6 +347,7 @@ save_settings() {
         printf 'SOCKS_PASS=%q\n' "$SOCKS_PASS"
         printf 'WARP_ENDPOINT=%q\n' "$WARP_ENDPOINT"
         printf 'WARP_MTU=%q\n' "$WARP_MTU"
+        printf 'RESOLVE_STRATEGY=%q\n' "$RESOLVE_STRATEGY"
     } > "$SETTINGS_FILE"
     chmod 600 "$SETTINGS_FILE"
 }
@@ -394,6 +399,13 @@ Password = ${SOCKS_PASS}
 EOF
         fi
     } > "$PROXY_CONF"
+
+    # 域名解析出口优先级：auto / ipv4 / ipv6
+    cat >> "$PROXY_CONF" << EOF
+
+[Resolve]
+ResolveStrategy = ${RESOLVE_STRATEGY:-auto}
+EOF
     chmod 600 "$PROXY_CONF"
 }
 
@@ -885,6 +897,7 @@ show_info() {
     echo -e "SOCKS5 认证 : ${auth_desc}"
     echo -e "Endpoint    : ${WARP_ENDPOINT}"
     echo -e "MTU         : ${WARP_MTU}"
+    echo -e "域名出口    : ${RESOLVE_STRATEGY}（$(describe_resolve_strategy "$RESOLVE_STRATEGY")）"
     echo -e "配置文件    : ${PROXY_CONF}"
     if [[ -n "$ip" ]]; then
         case "$warp" in
@@ -1155,6 +1168,93 @@ change_port() {
     fi
 }
 
+# 规范化出口优先级参数
+normalize_resolve_strategy() {
+    local value
+    value=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    case "$value" in
+        auto) echo "auto" ;;
+        v4|4|ipv4) echo "ipv4" ;;
+        v6|6|ipv6) echo "ipv6" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 出口优先级说明
+describe_resolve_strategy() {
+    case "$1" in
+        ipv4) echo "IPv4 优先" ;;
+        ipv6) echo "IPv6 优先" ;;
+        *) echo "双栈时优先 IPv6" ;;
+    esac
+}
+
+# 设置域名出口优先级：auto / ipv4 / ipv6
+change_stack() {
+    require_installed || return 1
+
+    local target="$1" input old_strategy old_ip new_ip
+    old_strategy="$RESOLVE_STRATEGY"
+
+    if [[ -z "$target" ]]; then
+        echo -e "当前域名出口优先级: ${GREEN}${RESOLVE_STRATEGY}${PLAIN}（$(describe_resolve_strategy "$RESOLVE_STRATEGY")）"
+        echo ""
+        echo -e " ${GREEN}1.${PLAIN} auto  ${YELLOW}(默认，双栈时优先 IPv6)${PLAIN}"
+        echo -e " ${GREEN}2.${PLAIN} v4    ${YELLOW}(优先使用 IPv4 出口)${PLAIN}"
+        echo -e " ${GREEN}3.${PLAIN} v6    ${YELLOW}(优先使用 IPv6 出口)${PLAIN}"
+        echo ""
+        read -rp "请选择 [1-3]（直接回车取消）: " input </dev/tty || input=""
+        case "$input" in
+            1) target="auto" ;;
+            2) target="v4" ;;
+            3) target="v6" ;;
+            "") return 0 ;;
+            *)
+                echo -e "${RED}输入无效。${PLAIN}"
+                return 1
+                ;;
+        esac
+    fi
+
+    target=$(normalize_resolve_strategy "$target") || {
+        echo -e "${RED}无效的出口优先级: $1（可选 auto / v4 / v6）${PLAIN}"
+        return 1
+    }
+
+    if [[ "$target" == "$old_strategy" ]]; then
+        echo -e "${YELLOW}当前已经是 ${target}（$(describe_resolve_strategy "$target")），无需修改。${PLAIN}"
+        return 0
+    fi
+
+    old_ip=$(get_proxy_ip)
+
+    RESOLVE_STRATEGY="$target"
+    save_settings
+    if ! generate_proxy_config; then
+        RESOLVE_STRATEGY="$old_strategy"
+        save_settings
+        generate_proxy_config
+        return 1
+    fi
+
+    if test_config && service_restart >/dev/null 2>&1 && wait_proxy_ready 10; then
+        new_ip=$(get_proxy_ip)
+        echo -e "${GREEN}出口优先级已切换为: ${target}（$(describe_resolve_strategy "$target")）${PLAIN}"
+        if [[ -n "$old_ip" || -n "$new_ip" ]]; then
+            echo -e "出口 IP: ${old_ip:-未知} -> ${new_ip:-未知}"
+        fi
+        show_info
+    else
+        echo -e "${RED}切换后代理不可用，正在恢复原优先级...${PLAIN}"
+        RESOLVE_STRATEGY="$old_strategy"
+        save_settings
+        generate_proxy_config
+        service_restart >/dev/null 2>&1
+        wait_proxy_ready 6 || true
+        return 1
+    fi
+}
+
 # 绑定 WARP+ 许可证
 apply_license() {
     require_installed || return 1
@@ -1315,6 +1415,7 @@ install_all() {
     echo -e " 安装完成！"
     echo -e " 管理命令: ${YELLOW}warp${PLAIN}"
     echo -e " 切换出口 IP: ${YELLOW}warp ip${PLAIN}"
+    echo -e " 设置出口优先级: ${YELLOW}warp stack${PLAIN}"
     echo -e " 查看信息: ${YELLOW}warp info${PLAIN}"
     echo -e " 配置文件: ${PROXY_CONF}"
     if [[ "$LISTEN_ADDR" == "0.0.0.0" ]]; then
@@ -1337,13 +1438,14 @@ ${GREEN}WireProxy-WARP 服务管理工具 (warp)${PLAIN}
  7. 切换 WARP 出口 IP (ip)
  8. 更换 Endpoint (endpoint)
  9. 修改 SOCKS5 端口 (port)
-10. 重新注册 WARP 账户 (reg)
-11. 绑定 WARP+ 许可证 (plus)
-12. 编辑配置文件 (edit)
-13. 卸载 WireProxy-WARP (uninstall)
+10. 设置出口优先级 (stack)
+11. 重新注册 WARP 账户 (reg)
+12. 绑定 WARP+ 许可证 (plus)
+13. 编辑配置文件 (edit)
+14. 卸载 WireProxy-WARP (uninstall)
  0. 退出
 ------------------------"
-    read -rp "请输入选项 [0-13]: " choice </dev/tty
+    read -rp "请输入选项 [0-14]: " choice </dev/tty
     case "$choice" in
         1) start_service ;;
         2) stop_service ;;
@@ -1354,10 +1456,11 @@ ${GREEN}WireProxy-WARP 服务管理工具 (warp)${PLAIN}
         7) switch_warp_ip ;;
         8) change_endpoint ;;
         9) change_port ;;
-        10) reg_command ;;
-        11) apply_license ;;
-        12) edit_config ;;
-        13) uninstall_all ;;
+        10) change_stack ;;
+        11) reg_command ;;
+        12) apply_license ;;
+        13) edit_config ;;
+        14) uninstall_all ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效！${PLAIN}" ;;
     esac
@@ -1396,6 +1499,7 @@ main() {
         ip|change-ip|switch) switch_warp_ip ;;
         endpoint|ep) change_endpoint ;;
         port) change_port ;;
+        stack) change_stack "$2" ;;
         reg|register) reg_command ;;
         plus|license) apply_license ;;
         edit) edit_config ;;
