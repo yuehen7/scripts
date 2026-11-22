@@ -15,7 +15,7 @@
 - 需要 bash 4+（Alpine 需先手动安装 bash，见下文）
 - 支持架构：x86_64、arm64、armv7、s390x、riscv64
 - 依赖：`curl`、`wget`、`jq`、`openssl`、`tar`/`unzip`、`iproute2`（脚本会自动安装；bash 必须预先存在）
-- Argo 隧道模式会额外下载 `cloudflared`（支持 Linux amd64 / arm64 / armv7 / i386），不依赖系统软件包
+- Argo quick 模式会额外下载 `cloudflared`（支持 Linux amd64 / arm64 / armv7 / i386）；sing-box named 模式使用 1.14+ 内置 cloudflared，不需要额外二进制
 
 > WireProxy-WARP 由 wgcf 注册账户，wgcf 官方仅提供 x86_64、arm64、armv7、386、s390x 二进制，暂不支持 riscv64。WARP 使用 UDP 出站，服务器需能访问 CloudFlare 的 WARP Endpoint（默认 2408 端口）。
 
@@ -33,7 +33,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install
 bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_singbox.sh)
 ```
 
-Xray / sing-box 安装流程：安装依赖 → 应用 BBR/网络优化 → 下载内核 → **交互选择入站协议** → 生成配置 → 注册服务（systemd/OpenRC）→ 启动。选择 Argo 隧道时会额外下载 `cloudflared` 并注册 `cloudflared-argo` 服务。
+Xray / sing-box 安装流程：安装依赖 → 应用 BBR/网络优化 → 下载内核 → **交互选择入站协议** → 生成配置 → 注册服务（systemd/OpenRC）→ 启动。Xray 的 Argo 和 sing-box 的 Argo quick 模式会额外下载 `cloudflared`；sing-box 的 Argo named 模式使用内置 cloudflared。
 
 ### WireProxy-WARP
 
@@ -70,6 +70,7 @@ sing-box / WARP 同理，把文件名换成 `install_singbox.sh` / `install_warp
 | 3 | Xray / sing-box | VMess + WS + TLS | 2053 | WS 路径 `/175443`，支持 CDN 回源 |
 | 4 | sing-box | Hysteria2 | 8443/UDP | QUIC，密码自动生成 |
 | 4 | Xray | Argo 隧道 | 本地 WS 2083 | 明文 VMess-WS + 外部 cloudflared，支持 quick / named |
+| 5 | sing-box | Argo 隧道 | 本地 WS 2083 | quick 用外部 cloudflared；named 用 sing-box 内置 cloudflared |
 
 输入方式：
 
@@ -84,12 +85,13 @@ sing-box / WARP 同理，把文件名换成 `install_singbox.sh` / `install_warp
 
 说明：
 
-- VLESS-Reality 与 VMess-WS-TLS 共用固定 UUID `8326d9fd-3246-4ca0-aa48-894f0e7d96d6`；Xray 的 Argo 明文 VMess-WS 入站也复用该 UUID。
+- VLESS-Reality 与 VMess-WS-TLS 共用固定 UUID `8326d9fd-3246-4ca0-aa48-894f0e7d96d6`；Xray / sing-box 的 Argo 明文 VMess-WS 入站也复用该 UUID。
 - VMess-WS-TLS 与 Hysteria2 需要证书；只选 Shadowsocks / VLESS-Reality 时无需证书。
 - Shadowsocks 密码、Hysteria2 密码、Reality 密钥对和 Short ID 在每次重新生成配置时都会更新。
 - Hysteria2 使用 UDP，端口检查会分别检查 TCP 与 UDP；请确保本机防火墙和云安全组放行对应的 UDP 端口。
 - Hysteria2 不能通过 Cloudflare Argo 等仅支持 HTTP/WebSocket 的隧道转发。
 - Xray 的第 4 项是 Argo 隧道，会新增一个仅监听 `127.0.0.1` 的明文 VMess-WS 入站；详细配置见下文。
+- sing-box 的第 5 项也是 Argo 隧道：quick 模式使用外部 cloudflared，named 模式使用 sing-box 1.14+ 内置 cloudflared；详细配置见下文。
 
 ### Hysteria2
 
@@ -133,6 +135,50 @@ xr argo uninstall  # 仅卸载 Argo
 - 服务器不需要放行 Argo 入站端口，但需要能出站访问 Cloudflare
 - named 模式的 Token 保存在 `/etc/xray/argo/token`（权限 `600`）
 - 修改 Argo 模式或端口后执行 `xr gen`，再执行 `xr restart` 使配置生效
+
+### sing-box Argo 隧道
+
+sing-box 的第 5 项支持两种模式：
+
+- **quick**：外部 cloudflared + 本地明文 VMess-WS，随机 `*.trycloudflare.com` 域名。选择后会自动下载 `cloudflared` 并注册 `cloudflared-singbox-argo` 服务。
+- **named**：sing-box 1.14+ 内置 `cloudflared` 入站 + 本地明文 VMess-WS，使用 Tunnel Token，域名固定。不需要额外下载 cloudflared。
+
+配置流程：
+
+1. 选择 quick / named
+2. 选择 cloudflared 连接 Cloudflare 边缘使用 IPv4 还是 IPv6
+3. named 模式额外输入 Tunnel Token 和公开域名
+
+named 模式需要在 Cloudflare Zero Trust 面板把 Public Hostname 指向：
+
+```text
+http://127.0.0.1:<本地 WS 端口>
+```
+
+管理：
+
+```shell
+sb argo            # 交互菜单
+sb argo status
+sb argo info
+sb argo start      # quick 启动外部 cloudflared；named 等同 sb start
+sb argo stop       # quick 停止外部 cloudflared；named 等同 sb stop
+sb argo restart
+sb argo log        # quick 看 cloudflared 日志；named 看 sing-box 日志
+sb argo update     # quick 更新 cloudflared；named 请使用 sb update
+sb argo uninstall  # 仅卸载 Argo 外部服务与状态
+```
+
+说明：
+
+- quick 的 cloudflared 路径：`/usr/local/bin/cloudflared-singbox-argo`
+- quick 服务名：`cloudflared-singbox-argo`，日志：`/var/log/cloudflared-singbox-argo.log`
+- named 的 Token 写入 `/etc/sing-box/config.json`，脚本会将该文件权限设为 `600`
+- named 模式会自动添加路由规则，放行内置 cloudflared 对 `127.0.0.1` 的连接，避免被 `ip_is_private` 规则拒绝
+- quick 支持架构：x86_64、arm64、armv7、i386；named 的架构随 sing-box
+- Argo 只代理 HTTP/WebSocket/TCP，不能转发 Hysteria2 等 UDP 协议
+- 服务器不需要放行 Argo 入站端口，但需要能出站访问 Cloudflare
+- 修改 Argo 模式或端口后执行 `sb gen`，再执行 `sb restart` 使配置生效
 
 ## 住宅 IP 出站
 
@@ -236,10 +282,10 @@ warp        # WireProxy-WARP 交互菜单
 | `gen` | ✅ | ✅ | 重新选择协议并生成配置 |
 | `bbr` | ✅ | ✅ | 查看/重新应用 BBR 优化 |
 | `update` | ❌ | ✅ | 更新 sing-box 内核 |
-| `argo` | ✅ | ❌ | 管理 Xray 的 Argo 隧道（status/info/start/stop/restart/log/update/uninstall） |
+| `argo` | ✅ | ✅ | 管理 Argo 隧道（status/info/start/stop/restart/log/update/uninstall） |
 | `uninstall` | ✅ | ✅ | 卸载脚本与内核 |
 
-Xray 启用 Argo 后，`xr start` / `xr stop` / `xr restart` / `xr status` 会同时管理 Xray 和 cloudflared；也可以使用 `xr argo` 单独管理隧道。
+Xray 启用 Argo quick 后，`xr start` / `xr stop` / `xr restart` / `xr status` 会同时管理 Xray 和外部 cloudflared；sing-box quick 模式同理。sing-box named 模式的 cloudflared 内置于 sing-box，随 `sb start` / `sb stop` / `sb restart` 一起管理。
 
 示例：
 
@@ -260,7 +306,7 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 - 服务器地址、端口、UUID 或 Shadowsocks 密码
 - 分享链接：`vless://`、`vmess://`（含 Argo）、`ss://`、`hysteria2://`
 - Mihomo 可用的节点 JSON（添加到 `proxies` 数组）
-- 启用 Argo 时，`xr info` 会输出当前 quick 域名或 named 固定域名对应的 `vmess://` 链接
+- 启用 Argo 时，`xr info` / `sb info` 会输出当前 quick 域名或 named 固定域名对应的 `vmess://` 链接
 
 ## 证书
 
@@ -298,7 +344,7 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 
 Hysteria2 是 UDP/QUIC 协议，除本机防火墙外，云安全组也必须放行对应的 **UDP** 端口。
 
-Argo 本地 VMess-WS 仅监听 `127.0.0.1`，无需放行；对外流量由 cloudflared 主动出站连接 Cloudflare 边缘。
+Argo 本地 VMess-WS 仅监听 `127.0.0.1`，无需放行；对外流量由 cloudflared 主动出站连接 Cloudflare 边缘。Xray 和 sing-box 都默认使用 `2083`，如果在同一台机器同时启用两者的 Argo，需要为其中一个修改本地端口。
 
 WireProxy 仅监听 `127.0.0.1` 时无需放行端口；监听 `0.0.0.0` 时需放行对应 TCP 端口，并建议启用 SOCKS5 用户名/密码认证、限制来源 IP。WARP 本身通过 UDP 连接 CloudFlare Endpoint（默认 2408），无需在服务器上放行入站 UDP。
 
@@ -317,11 +363,13 @@ WireProxy 仅监听 `127.0.0.1` 时无需放行端口；监听 `0.0.0.0` 时需�
 ## 更新与卸载
 
 ```shell
-sb update          # 更新 sing-box 到最新版
+sb update          # 更新 sing-box 到最新版（named 模式的内置 cloudflared 随之更新）
+sb argo update     # 更新 sing-box quick 模式使用的外部 cloudflared
 xr argo update     # 更新 Xray 使用的 cloudflared
 xr uninstall       # 卸载 Xray（同时清理 Argo 服务与 cloudflared）
-xr argo uninstall  # 仅卸载 Argo 隧道
-sb uninstall       # 卸载 sing-box
+xr argo uninstall  # 仅卸载 Xray 的 Argo 隧道
+sb uninstall       # 卸载 sing-box（同时清理 Argo 外部服务与 cloudflared）
+sb argo uninstall  # 仅卸载 sing-box 的 Argo
 warp uninstall     # 卸载 WireProxy-WARP
 ```
 

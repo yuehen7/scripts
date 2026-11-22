@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
 # sing-box 一键安装、服务管理、BBR 调优、配置生成与节点查看脚本
-# 入站: 可选 Shadowsocks(默认32443) / VLESS-Reality(默认443) / VMess-WS-TLS(默认2053) / Hysteria2(默认8443 UDP)
+# 入站: 可选 Shadowsocks(默认32443) / VLESS-Reality(默认443) / VMess-WS-TLS(默认2053) / Hysteria2(默认8443 UDP) / Argo 隧道
 # 支持 systemd (Debian/Ubuntu/CentOS 等) 与 OpenRC (Alpine 等)
 # =========================================================
 
@@ -48,6 +48,21 @@ DEFAULT_VMESS_WS_PORT="$VMESS_WS_PORT"
 DEFAULT_HY2_PORT="$HY2_PORT"
 # VLESS-Reality 与 VMess-WS-TLS 共用固定 UUID
 FIXED_UUID="8326d9fd-3246-4ca0-aa48-894f0e7d96d6"
+
+# Argo 隧道：quick 使用外部 cloudflared，named 使用 sing-box 内置 cloudflared 入站
+ARGO_WS_PORT=2083
+DEFAULT_ARGO_WS_PORT="$ARGO_WS_PORT"
+ARGO_WS_PATH="/argo-${FIXED_UUID:0:8}"
+ARGO_DIR="${CONFIG_DIR}/argo"
+ARGO_MODE_FILE="${ARGO_DIR}/mode"
+ARGO_DOMAIN_FILE="${ARGO_DIR}/domain"
+ARGO_EDGE_IP_FILE="${ARGO_DIR}/edge_ip"
+# 外部 cloudflared（仅 quick 模式使用）
+ARGO_BIN="/usr/local/bin/cloudflared-singbox-argo"
+ARGO_SERVICE_NAME="cloudflared-singbox-argo"
+ARGO_SYSTEMD_FILE="/etc/systemd/system/${ARGO_SERVICE_NAME}.service"
+ARGO_INITD_FILE="/etc/init.d/${ARGO_SERVICE_NAME}"
+ARGO_LOG="/var/log/${ARGO_SERVICE_NAME}.log"
 
 set -o pipefail
 
@@ -136,6 +151,525 @@ reload_sysctl() {
     fi
     [[ -f "$SYSCTL_BBR_FILE" ]] && sysctl -p "$SYSCTL_BBR_FILE" >/dev/null 2>&1
     return 0
+}
+
+# =========================================================
+# Argo 隧道管理
+# quick: 外部 cloudflared + 本地明文 VMess-WS
+# named: sing-box 内置 cloudflared 入站 + 本地明文 VMess-WS
+# =========================================================
+
+argo_is_configured() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    jq -e 'any(.inbounds[]?; .tag == "vmess-ws-argo-in")' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+argo_is_quick() {
+    [[ "$(argo_mode)" == "quick" ]]
+}
+
+argo_is_named() {
+    [[ "$(argo_mode)" == "named" ]]
+}
+
+argo_mode() {
+    [[ -s "$ARGO_MODE_FILE" ]] && tr -d '[:space:]' < "$ARGO_MODE_FILE"
+}
+
+argo_domain() {
+    [[ -s "$ARGO_DOMAIN_FILE" ]] && tr -d '[:space:]' < "$ARGO_DOMAIN_FILE"
+}
+
+argo_edge_ip() {
+    local ip=""
+    [[ -s "$ARGO_EDGE_IP_FILE" ]] && ip=$(tr -d '[:space:]' < "$ARGO_EDGE_IP_FILE")
+    if [[ "$ip" != "4" && "$ip" != "6" ]]; then
+        ip="4"
+    fi
+    printf '%s\n' "$ip"
+}
+
+argo_ws_port() {
+    jq -r '.inbounds[] | select(.tag=="vmess-ws-argo-in") | .listen_port' "$CONFIG_FILE" 2>/dev/null
+}
+
+argo_ws_path() {
+    jq -r '.inbounds[] | select(.tag=="vmess-ws-argo-in") | .transport.path' "$CONFIG_FILE" 2>/dev/null
+}
+
+argo_uuid() {
+    jq -r '.inbounds[] | select(.tag=="vmess-ws-argo-in") | .users[0].uuid' "$CONFIG_FILE" 2>/dev/null
+}
+
+argo_has_builtin_inbound() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    jq -e 'any(.inbounds[]?; .tag == "cloudflared-in")' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+save_argo_state() {
+    local mode="$1" domain="$2" edge_ip="$3"
+    mkdir -p "$ARGO_DIR" || return 1
+    chmod 700 "$ARGO_DIR" 2>/dev/null || true
+    : > "$ARGO_LOG" 2>/dev/null || true
+    printf '%s\n' "$mode" > "$ARGO_MODE_FILE" || return 1
+    printf '%s\n' "$edge_ip" > "$ARGO_EDGE_IP_FILE" || return 1
+    if [[ "$mode" == "named" ]]; then
+        printf '%s\n' "$domain" > "$ARGO_DOMAIN_FILE" || return 1
+    else
+        : > "$ARGO_DOMAIN_FILE" || return 1
+    fi
+}
+
+clear_argo_state() {
+    rm -rf "$ARGO_DIR"
+}
+
+# 外部 cloudflared 服务（仅 quick 模式）
+argo_service_start() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl start "$ARGO_SERVICE_NAME" ;;
+        openrc) rc-service "$ARGO_SERVICE_NAME" start ;;
+        *) return 1 ;;
+    esac
+}
+
+argo_service_stop() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl stop "$ARGO_SERVICE_NAME" >/dev/null 2>&1 || true ;;
+        openrc) rc-service "$ARGO_SERVICE_NAME" stop >/dev/null 2>&1 || true ;;
+        *) return 1 ;;
+    esac
+}
+
+argo_service_is_active() {
+    case "$INIT_SYSTEM" in
+        systemd) systemctl is-active --quiet "$ARGO_SERVICE_NAME" ;;
+        openrc) rc-service "$ARGO_SERVICE_NAME" status >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+argo_service_remove() {
+    case "$INIT_SYSTEM" in
+        systemd)
+            systemctl stop "$ARGO_SERVICE_NAME" >/dev/null 2>&1 || true
+            systemctl disable "$ARGO_SERVICE_NAME" >/dev/null 2>&1 || true
+            rm -f "$ARGO_SYSTEMD_FILE"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            ;;
+        openrc)
+            rc-service "$ARGO_SERVICE_NAME" stop >/dev/null 2>&1 || true
+            rc-update del "$ARGO_SERVICE_NAME" default >/dev/null 2>&1 || true
+            rm -f "$ARGO_INITD_FILE"
+            ;;
+    esac
+    rm -f "$ARGO_LOG"
+}
+
+detect_argo_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64) ARGO_ASSET="cloudflared-linux-amd64" ;;
+        aarch64|arm64) ARGO_ASSET="cloudflared-linux-arm64" ;;
+        armv7l|armv7) ARGO_ASSET="cloudflared-linux-arm" ;;
+        i386|i686) ARGO_ASSET="cloudflared-linux-386" ;;
+        *) return 1 ;;
+    esac
+}
+
+download_cloudflared() {
+    local force="${1:-0}"
+    if [[ -x "$ARGO_BIN" && "$force" -ne 1 ]]; then
+        echo -e "${GREEN}cloudflared 已存在: ${ARGO_BIN}${PLAIN}"
+        return 0
+    fi
+
+    detect_argo_arch || {
+        echo -e "${RED}当前架构 $(uname -m) 不支持 cloudflared（仅支持 x86_64 / arm64 / armv7 / i386）。${PLAIN}"
+        return 1
+    }
+
+    echo -e "${YELLOW}正在下载 cloudflared (${ARGO_ASSET})...${PLAIN}"
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    if ! curl -L -f -o "${tmp_dir}/cloudflared" \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/${ARGO_ASSET}"; then
+        echo -e "${RED}cloudflared 下载失败，请检查网络。${PLAIN}"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    chmod +x "${tmp_dir}/cloudflared"
+    if ! "${tmp_dir}/cloudflared" --version >/dev/null 2>&1; then
+        echo -e "${RED}cloudflared 二进制无法运行，已放弃安装。${PLAIN}"
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    mv "${tmp_dir}/cloudflared" "$ARGO_BIN"
+    chmod 0755 "$ARGO_BIN"
+    rm -rf "$tmp_dir"
+    echo -e "${GREEN}cloudflared 已安装: $("$ARGO_BIN" --version 2>/dev/null | head -n 1)${PLAIN}"
+}
+
+argo_recent_logs() {
+    if [[ -f "$ARGO_LOG" ]]; then
+        tail -n 200 "$ARGO_LOG" 2>/dev/null || true
+    elif [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        journalctl -u "$ARGO_SERVICE_NAME" --no-pager -n 200 -o cat 2>/dev/null || true
+    fi
+}
+
+refresh_argo_domain_from_log() {
+    local domain
+    domain=$(argo_recent_logs | grep -oE 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' | tail -n 1 | sed 's#^https://##')
+    if [[ -n "$domain" ]]; then
+        printf '%s\n' "$domain" > "$ARGO_DOMAIN_FILE"
+        printf '%s\n' "$domain"
+        return 0
+    fi
+    return 1
+}
+
+wait_for_argo_domain() {
+    local waited=0 domain=""
+    while [[ $waited -lt 30 ]]; do
+        if domain=$(refresh_argo_domain_from_log); then
+            echo -e "${GREEN}Argo Quick Tunnel 域名: ${domain}${PLAIN}"
+            return 0
+        fi
+        if ! argo_service_is_active; then
+            echo -e "${RED}cloudflared 未保持运行，请执行 'sb argo log' 查看日志。${PLAIN}"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo -e "${YELLOW}等待 Argo 域名超时，请稍后执行 'sb argo info' 或 'sb argo log' 查看。${PLAIN}"
+    return 1
+}
+
+setup_argo_service() {
+    argo_is_configured || return 1
+    argo_is_quick || return 1
+
+    local port edge_ip command_args
+    port=$(argo_ws_port)
+    edge_ip=$(argo_edge_ip)
+
+    if [[ -z "$port" || "$port" == "null" ]]; then
+        echo -e "${RED}未找到 Argo 本地 WS 端口，请执行 'sb gen' 重新生成。${PLAIN}"
+        return 1
+    fi
+
+    mkdir -p "$ARGO_DIR"
+    touch "$ARGO_LOG" 2>/dev/null || true
+
+    command_args="tunnel --no-autoupdate --edge-ip-version ${edge_ip} --protocol http2 --logfile ${ARGO_LOG} --url http://127.0.0.1:${port}"
+
+    case "$INIT_SYSTEM" in
+        systemd)
+            cat << EOF > "$ARGO_SYSTEMD_FILE"
+[Unit]
+Description=Cloudflare Argo Tunnel for sing-box
+After=network-online.target sing-box.service
+Wants=network-online.target
+
+[Service]
+User=root
+ExecStart=${ARGO_BIN} ${command_args}
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload || return 1
+            systemctl enable "$ARGO_SERVICE_NAME" >/dev/null 2>&1 || return 1
+            echo -e "${GREEN}Argo quick 外部 cloudflared 服务已注册。${PLAIN}"
+            ;;
+        openrc)
+            cat << EOF > "$ARGO_INITD_FILE"
+#!/sbin/openrc-run
+
+name="${ARGO_SERVICE_NAME}"
+description="Cloudflare Argo Tunnel for sing-box"
+
+supervisor="supervise-daemon"
+command="${ARGO_BIN}"
+command_args="${command_args}"
+pidfile="/run/${ARGO_SERVICE_NAME}.pid"
+respawn_delay=5
+respawn_max=0
+output_log="/dev/null"
+error_log="/dev/null"
+rc_ulimit="-n 1048576"
+
+depend() {
+    need net
+    after firewall sing-box
+}
+EOF
+            chmod 0755 "$ARGO_INITD_FILE"
+            rc-update add "$ARGO_SERVICE_NAME" default >/dev/null 2>&1 || return 1
+            echo -e "${GREEN}Argo quick 外部 cloudflared 服务已注册。${PLAIN}"
+            ;;
+        *)
+            echo -e "${RED}未检测到 systemd 或 OpenRC，无法注册 Argo 服务。${PLAIN}"
+            return 1
+            ;;
+    esac
+}
+
+apply_argo_configuration() {
+    if [[ "${ENABLE_ARGO:-0}" -eq 1 ]]; then
+        if argo_is_quick; then
+            download_cloudflared || return 1
+            setup_argo_service || return 1
+        else
+            # named 模式使用 sing-box 内置 cloudflared，不需要外部服务
+            argo_service_remove
+        fi
+    else
+        argo_service_remove
+        clear_argo_state
+    fi
+}
+
+argo_external_start() {
+    argo_is_quick || return 0
+    argo_is_configured || return 0
+
+    if argo_service_is_active; then
+        if [[ -z "$(argo_domain)" ]]; then
+            refresh_argo_domain_from_log >/dev/null 2>&1 || true
+        fi
+        return 0
+    fi
+
+    : > "$ARGO_LOG" 2>/dev/null || true
+    argo_service_start || return 1
+    wait_for_argo_domain
+}
+
+argo_external_stop() {
+    argo_is_quick || return 0
+    argo_service_stop
+    rm -f "$ARGO_DOMAIN_FILE"
+}
+
+argo_external_restart() {
+    argo_is_quick || return 0
+    argo_service_stop
+    rm -f "$ARGO_DOMAIN_FILE"
+    argo_external_start
+}
+
+argo_status() {
+    echo -e "=== ${GREEN}Argo 隧道状态${PLAIN} ==="
+    if ! argo_is_configured; then
+        echo -e "未配置 Argo 隧道。可在 'sb gen' 中选择第 5 项。"
+        return 0
+    fi
+
+    local mode domain port path
+    mode=$(argo_mode)
+    port=$(argo_ws_port)
+    path=$(argo_ws_path)
+    domain=$(argo_domain)
+
+    echo -e "模式:       ${CYAN}${mode:-未配置}${PLAIN}"
+    if [[ "$mode" == "quick" ]]; then
+        echo -e "运行方式:   ${CYAN}外部 cloudflared${PLAIN}"
+        if argo_service_is_active; then
+            echo -e "服务状态:   ${GREEN}运行中${PLAIN}"
+        else
+            echo -e "服务状态:   ${RED}未运行${PLAIN}"
+        fi
+        if [[ -z "$domain" ]] && argo_service_is_active; then
+            domain=$(refresh_argo_domain_from_log 2>/dev/null || true)
+        fi
+        echo -e "公网域名:   ${CYAN}${domain:-尚未生成}${PLAIN}"
+        echo -e "日志文件:   ${CYAN}${ARGO_LOG}${PLAIN}"
+        echo -e "${YELLOW}提示: Quick Tunnel 域名在 cloudflared 重启后会变化，请重新执行 'sb info'。${PLAIN}"
+    elif [[ "$mode" == "named" ]]; then
+        echo -e "运行方式:   ${CYAN}sing-box 内置 cloudflared${PLAIN}"
+        if service_is_active; then
+            echo -e "服务状态:   ${GREEN}运行中 (sing-box)${PLAIN}"
+        else
+            echo -e "服务状态:   ${RED}未运行 (sing-box)${PLAIN}"
+        fi
+        echo -e "公网域名:   ${CYAN}${domain:-未配置}${PLAIN}"
+        if ! argo_has_builtin_inbound; then
+            echo -e "${YELLOW}提示: 配置中缺少 cloudflared-in 入站，请执行 'sb gen' 重新生成。${PLAIN}"
+        fi
+    else
+        echo -e "${YELLOW}Argo 模式配置缺失，请执行 'sb gen' 重新生成。${PLAIN}"
+    fi
+
+    echo -e "本地 WS:    ${CYAN}127.0.0.1:${port}${path}${PLAIN}"
+}
+
+view_argo_info() {
+    argo_is_configured || return 1
+
+    local mode domain port path uuid
+    mode=$(argo_mode)
+    port=$(argo_ws_port)
+    path=$(argo_ws_path)
+    uuid=$(argo_uuid)
+    domain=$(argo_domain)
+
+    if [[ "$mode" == "quick" && -z "$domain" ]] && argo_service_is_active; then
+        domain=$(refresh_argo_domain_from_log 2>/dev/null || true)
+    fi
+    if [[ -z "$domain" ]]; then
+        echo -e "${YELLOW}Argo 域名尚未生成（隧道未运行或正在启动），请稍后执行 'sb argo info'。${PLAIN}"
+        return 1
+    fi
+
+    echo -e "${GREEN}【协议: VMess + WS (Cloudflare Argo)】${PLAIN}"
+    if [[ "$mode" == "quick" ]]; then
+        echo -e "  模式 (Mode):        ${CYAN}quick（外部 cloudflared）${PLAIN}"
+        echo -e "  ${YELLOW}Quick Tunnel 域名在 cloudflared 重启后会变化。${PLAIN}"
+    else
+        echo -e "  模式 (Mode):        ${CYAN}named（sing-box 内置 cloudflared）${PLAIN}"
+        if ! argo_has_builtin_inbound; then
+            echo -e "  ${YELLOW}警告: 配置中缺少 cloudflared-in 入站，请执行 'sb gen' 重新生成。${PLAIN}"
+        fi
+    fi
+    echo -e "  公网域名 (Host):    ${CYAN}${domain}${PLAIN}"
+    echo -e "  本地监听 (Local):   ${CYAN}127.0.0.1:${port}${path}${PLAIN}"
+    echo -e "  用户 ID (UUID):     ${CYAN}${uuid}${PLAIN}"
+
+    local argo_vmess_json argo_link
+    argo_vmess_json=$(jq -cn \
+        --arg ps "sing-box-VMess-Argo" \
+        --arg add "$domain" \
+        --argjson port 443 \
+        --arg id "$uuid" \
+        --arg host "$domain" \
+        --arg path "$path" \
+        --arg sni "$domain" \
+        --arg alpn "http/1.1" \
+        '{v: "2", ps: $ps, add: $add, port: ($port | tostring), id: $id, aid: "0",
+          scy: "auto", net: "ws", type: "none", host: $host, path: $path,
+          tls: "tls", sni: $sni, alpn: $alpn, fp: "chrome"}')
+    argo_link="vmess://$(printf '%s' "$argo_vmess_json" | base64 | tr -d '\n')"
+    echo -e "  分享链接 (Link):"
+    echo -e "  ${YELLOW}${argo_link}${PLAIN}"
+    echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
+    jq -n \
+        --arg name "sing-box-VMess-Argo" \
+        --arg server "$domain" \
+        --argjson port 443 \
+        --arg uuid "$uuid" \
+        --arg host "$domain" \
+        --arg path "$path" \
+        '{
+          name: $name,
+          type: "vmess",
+          server: $server,
+          port: $port,
+          uuid: $uuid,
+          alterId: 0,
+          cipher: "auto",
+          udp: true,
+          tls: true,
+          servername: $host,
+          alpn: ["http/1.1"],
+          "client-fingerprint": "chrome",
+          network: "ws",
+          "ws-opts": {
+            path: $path,
+            headers: { Host: $host }
+          }
+        }'
+    echo -e "----------------------------------------------------------------"
+}
+
+argo_logs() {
+    if ! argo_is_configured; then
+        echo -e "${RED}未配置 Argo 隧道。${PLAIN}"
+        return 1
+    fi
+    if argo_is_quick; then
+        touch "$ARGO_LOG" 2>/dev/null || true
+        tail -f "$ARGO_LOG"
+    elif argo_is_named; then
+        echo -e "${YELLOW}named 模式使用 sing-box 内置 cloudflared，显示 sing-box 日志：${PLAIN}"
+        service_logs_follow
+    else
+        echo -e "${RED}Argo 模式配置缺失，请执行 'sb gen' 重新生成。${PLAIN}"
+        return 1
+    fi
+}
+
+argo_update() {
+    if ! argo_is_configured; then
+        echo -e "${RED}未配置 Argo 隧道。${PLAIN}"
+        return 1
+    fi
+    if argo_is_quick; then
+        download_cloudflared 1 || return 1
+        setup_argo_service || return 1
+        argo_external_restart
+    else
+        echo -e "${YELLOW}named 模式使用 sing-box 内置 cloudflared，请执行 'sb update' 更新 sing-box。${PLAIN}"
+    fi
+}
+
+argo_uninstall() {
+    argo_service_remove
+    clear_argo_state
+    rm -f "$ARGO_BIN"
+    echo -e "${GREEN}Argo 隧道外部服务、状态和 cloudflared 已删除。${PLAIN}"
+    echo -e "${YELLOW}如需同时移除本地 WS 和内置 cloudflared 入站，请执行 'sb gen' 并取消选择 Argo。${PLAIN}"
+}
+
+argo_menu() {
+    echo -e "
+${GREEN}Argo 隧道管理${PLAIN}
+------------------------
+ 1. 查看状态 (status)
+ 2. 查看节点信息 (info)
+ 3. 启动 (start)
+ 4. 停止 (stop)
+ 5. 重启 (restart)
+ 6. 查看日志 (log)
+ 7. 更新 cloudflared (update)
+ 8. 卸载 Argo (uninstall)
+ 0. 退出
+------------------------"
+    read -rp "请输入选项 [0-8]: " argo_choice </dev/tty
+    case "$argo_choice" in
+        1) argo_status ;;
+        2) view_argo_info ;;
+        3) start_service ;;
+        4) stop_service ;;
+        5) restart_service ;;
+        6) argo_logs ;;
+        7) argo_update ;;
+        8) argo_uninstall ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入无效！${PLAIN}" ;;
+    esac
+}
+
+argo_command() {
+    case "${1:-}" in
+        start) start_service ;;
+        stop) stop_service ;;
+        restart) restart_service ;;
+        status) argo_status ;;
+        info) view_argo_info ;;
+        log) argo_logs ;;
+        update) argo_update ;;
+        uninstall) argo_uninstall ;;
+        ""|menu) argo_menu ;;
+        *)
+            echo -e "${RED}未知 Argo 子命令: $1${PLAIN}"
+            argo_menu
+            ;;
+    esac
 }
 
 # 检查 root 权限
@@ -451,12 +985,16 @@ view_inbound_info() {
     local hy2_tag
     hy2_tag=$(jq -r '.inbounds[] | select(.tag=="hysteria2-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
 
+    # 解析 Argo 本地 WS 入站
+    local argo_tag
+    argo_tag=$(jq -r '.inbounds[] | select(.tag=="vmess-ws-argo-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+
     if jq -e 'any(.inbounds[]?; .tag == "vless-ws-tls-in")' "$CONFIG_FILE" >/dev/null 2>&1; then
         echo -e "${YELLOW}提示: 检测到旧版 VLESS-WS-TLS 入站，当前版本已改为 VMess-WS-TLS。${PLAIN}"
         echo -e "${YELLOW}      执行 'sb gen' 可重新选择并生成入站配置。${PLAIN}"
     fi
 
-    if [[ -z "$ss_tag" && -z "$r_tag" && -z "$ws_tag" && -z "$hy2_tag" ]]; then
+    if [[ -z "$ss_tag" && -z "$r_tag" && -z "$ws_tag" && -z "$hy2_tag" && -z "$argo_tag" ]]; then
         echo -e "${RED}未找到可识别的入站配置，请执行 'sb gen' 重新生成。${PLAIN}"
         return 1
     fi
@@ -654,6 +1192,10 @@ view_inbound_info() {
         echo -e "----------------------------------------------------------------"
     fi
 
+    if [[ -n "$argo_tag" ]]; then
+        view_argo_info
+    fi
+
     # 住宅 IP 出站
     if jq -e 'any(.outbounds[]?; .tag == "residential-out")' "$CONFIG_FILE" >/dev/null 2>&1; then
         local proxy_type proxy_server proxy_port proxy_user proxy_pass proxy_type_display
@@ -697,6 +1239,7 @@ select_inbound_protocols() {
     ENABLE_REALITY=0
     ENABLE_VMESS=0
     ENABLE_HY2=0
+    ENABLE_ARGO=0
     SELECTED_PORTS=()
 
     local input token
@@ -706,23 +1249,25 @@ select_inbound_protocols() {
         echo -e "  ${GREEN}2)${PLAIN} VLESS + Reality  ${YELLOW}默认端口 ${DEFAULT_REALITY_PORT}${PLAIN}"
         echo -e "  ${GREEN}3)${PLAIN} VMess + WS + TLS ${YELLOW}默认端口 ${DEFAULT_VMESS_WS_PORT}${PLAIN}"
         echo -e "  ${GREEN}4)${PLAIN} Hysteria2        ${YELLOW}默认端口 ${DEFAULT_HY2_PORT} (UDP)，QUIC${PLAIN}"
+        echo -e "  ${GREEN}5)${PLAIN} Argo 隧道        ${YELLOW}本地明文 VMess-WS(默认 ${DEFAULT_ARGO_WS_PORT}) + quick/named${PLAIN}"
         read -rp "请输入编号（多个用空格或逗号分隔，输入 all 全选）: " input </dev/tty || return 1
         input=$(printf '%s' "$input" | tr ',' ' ')
 
-        local ss=0 reality=0 vmess=0 hy2=0 invalid=0
+        local ss=0 reality=0 vmess=0 hy2=0 argo=0 invalid=0
         for token in $input; do
             case "$token" in
                 1) ss=1 ;;
                 2) reality=1 ;;
                 3) vmess=1 ;;
                 4) hy2=1 ;;
-                all|ALL|All) ss=1; reality=1; vmess=1; hy2=1 ;;
+                5) argo=1 ;;
+                all|ALL|All) ss=1; reality=1; vmess=1; hy2=1; argo=1 ;;
                 *) invalid=1 ;;
             esac
         done
 
-        if [[ $invalid -eq 1 || $((ss + reality + vmess + hy2)) -eq 0 ]]; then
-            echo -e "${RED}输入无效，请输入 1、2、3、4 的组合（如 1,3），或输入 all。${PLAIN}"
+        if [[ $invalid -eq 1 || $((ss + reality + vmess + hy2 + argo)) -eq 0 ]]; then
+            echo -e "${RED}输入无效，请输入 1、2、3、4、5 的组合（如 1,3），或输入 all。${PLAIN}"
             continue
         fi
 
@@ -730,6 +1275,7 @@ select_inbound_protocols() {
         ENABLE_REALITY=$reality
         ENABLE_VMESS=$vmess
         ENABLE_HY2=$hy2
+        ENABLE_ARGO=$argo
         break
     done
 
@@ -738,6 +1284,7 @@ select_inbound_protocols() {
     [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality"
     [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS"
     [[ $ENABLE_HY2 -eq 1 ]] && echo -e "  - Hysteria2"
+    [[ $ENABLE_ARGO -eq 1 ]] && echo -e "  - Argo 隧道 (VMess-WS 明文)"
     return 0
 }
 
@@ -783,6 +1330,7 @@ configure_inbound_ports() {
     REALITY_PORT="$DEFAULT_REALITY_PORT"
     VMESS_WS_PORT="$DEFAULT_VMESS_WS_PORT"
     HY2_PORT="$DEFAULT_HY2_PORT"
+    ARGO_WS_PORT="$DEFAULT_ARGO_WS_PORT"
     SELECTED_PORTS=()
 
     if [[ $ENABLE_SS -eq 1 ]]; then
@@ -801,12 +1349,17 @@ configure_inbound_ports() {
         HY2_PORT=$(prompt_inbound_port "Hysteria2 (UDP)" "$HY2_PORT")
         SELECTED_PORTS+=("$HY2_PORT")
     fi
+    if [[ $ENABLE_ARGO -eq 1 ]]; then
+        ARGO_WS_PORT=$(prompt_inbound_port "Argo 本地 WS (仅 127.0.0.1)" "$ARGO_WS_PORT")
+        SELECTED_PORTS+=("$ARGO_WS_PORT")
+    fi
 
     echo -e "${GREEN}入站端口：${PLAIN}"
     [[ $ENABLE_SS -eq 1 ]] && echo -e "  - Shadowsocks: ${SS_PORT}"
     [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality: ${REALITY_PORT}"
     [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS: ${VMESS_WS_PORT}"
     [[ $ENABLE_HY2 -eq 1 ]] && echo -e "  - Hysteria2: ${HY2_PORT} (UDP)"
+    [[ $ENABLE_ARGO -eq 1 ]] && echo -e "  - Argo 本地 WS: ${ARGO_WS_PORT} (仅 127.0.0.1)"
     return 0
 }
 
@@ -950,6 +1503,53 @@ generate_production_config() {
         if is_self_signed_cert; then
             echo -e "${YELLOW}提示: 当前使用自签证书，Hysteria2 客户端需要开启跳过证书校验 (insecure / skip-cert-verify)。${PLAIN}"
         fi
+    fi
+
+    local argo_mode="" argo_public_domain="" argo_token="" argo_edge_ip="4" argo_named=0
+    if [[ $ENABLE_ARGO -eq 1 ]]; then
+        echo -e "\n${CYAN}Argo 隧道配置${PLAIN}"
+        echo -e "  ${GREEN}1)${PLAIN} quick  随机域名，使用外部 cloudflared + 本地明文 WS"
+        echo -e "  ${GREEN}2)${PLAIN} named  固定域名，使用 sing-box 内置 cloudflared（需要 Tunnel Token）"
+        local argo_mode_choice
+        read -rp "请选择 Argo 模式 [1/2，默认 1]: " argo_mode_choice </dev/tty || argo_mode_choice=""
+        case "$argo_mode_choice" in
+            2|named|NAMED) argo_mode="named"; argo_named=1 ;;
+            *) argo_mode="quick" ;;
+        esac
+
+        local argo_ip_choice
+        read -rp "Argo 连接 Cloudflare 边缘使用 IPv4 还是 IPv6？[4/6，默认 4]: " argo_ip_choice </dev/tty || argo_ip_choice=""
+        if [[ "$argo_ip_choice" == "6" ]]; then
+            argo_edge_ip="6"
+        else
+            argo_edge_ip="4"
+        fi
+
+        if [[ $argo_named -eq 1 ]]; then
+            while true; do
+                read -rsp "请输入 Cloudflare Tunnel Token（输入不回显）: " argo_token </dev/tty || argo_token=""
+                echo
+                argo_token=$(printf '%s' "$argo_token" | tr -d '[:space:]')
+                if [[ -n "$argo_token" ]]; then
+                    break
+                fi
+                echo -e "${RED}Token 不能为空。${PLAIN}"
+            done
+
+            while true; do
+                read -rp "请输入该 Tunnel 绑定的完整域名 (例如 argo.example.com): " argo_public_domain </dev/tty || argo_public_domain=""
+                argo_public_domain=$(printf '%s' "$argo_public_domain" | tr -d '[:space:]')
+                argo_public_domain=${argo_public_domain%.}
+                argo_public_domain=${argo_public_domain,,}
+                if validate_domain "$argo_public_domain"; then
+                    break
+                fi
+                echo -e "${RED}域名格式无效，请输入完整域名，例如 argo.example.com。${PLAIN}"
+            done
+
+            echo -e "${YELLOW}请确保已在 Cloudflare Zero Trust 中将该域名指向 http://127.0.0.1:${ARGO_WS_PORT}${PLAIN}"
+        fi
+        echo -e "${GREEN}Argo 模式: ${argo_mode}${PLAIN}"
     fi
 
     # VLESS 与 VMess 共用固定 UUID
@@ -1107,6 +1707,42 @@ generate_production_config() {
             }]' <<<"$inbounds") || return 1
     fi
 
+    if [[ $ENABLE_ARGO -eq 1 ]]; then
+        inbounds=$(jq -c \
+            --argjson port "$ARGO_WS_PORT" \
+            --arg uuid "$uuid" \
+            --arg path "$ARGO_WS_PATH" \
+            '. + [{
+              "type": "vmess",
+              "tag": "vmess-ws-argo-in",
+              "listen": "127.0.0.1",
+              "listen_port": $port,
+              "users": [
+                {
+                  "uuid": $uuid,
+                  "alterId": 0
+                }
+              ],
+              "transport": {
+                "type": "ws",
+                "path": $path
+              }
+            }]' <<<"$inbounds") || return 1
+    fi
+
+    if [[ $ENABLE_ARGO -eq 1 && $argo_named -eq 1 ]]; then
+        inbounds=$(jq -c \
+            --arg token "$argo_token" \
+            --argjson edge_ip "$argo_edge_ip" \
+            '. + [{
+              "type": "cloudflared",
+              "tag": "cloudflared-in",
+              "token": $token,
+              "protocol": "http2",
+              "edge_ip_version": $edge_ip
+            }]' <<<"$inbounds") || return 1
+    fi
+
     # 出站：启用住宅 IP 时作为默认出站
     local outbounds final_outbound="direct"
     if [[ $RESIDENTIAL_ENABLED -eq 1 ]]; then
@@ -1133,7 +1769,7 @@ generate_production_config() {
         outbounds='[{"type":"direct","tag":"direct"}]'
     fi
 
-    if ! jq -n --argjson inbounds "$inbounds" --argjson outbounds "$outbounds" --arg final "$final_outbound" '{
+    if ! jq -n --argjson inbounds "$inbounds" --argjson outbounds "$outbounds" --arg final "$final_outbound" --argjson argo_named "$argo_named" '{
       "log": {
         "disabled": false,
         "level": "info",
@@ -1142,7 +1778,12 @@ generate_production_config() {
       "inbounds": $inbounds,
       "outbounds": $outbounds,
       "route": {
-        "rules": [
+        "rules": ([
+          (if $argo_named == 1 then {
+            "inbound": ["cloudflared-in"],
+            "action": "route",
+            "outbound": "direct"
+          } else empty end),
           {
             "action": "sniff",
             "sniffer": [
@@ -1161,7 +1802,7 @@ generate_production_config() {
             "ip_is_private": true,
             "action": "reject"
           }
-        ],
+        ]),
         "rule_set": [
           {
             "type": "remote",
@@ -1177,6 +1818,17 @@ generate_production_config() {
     }' > "$CONFIG_FILE"; then
         echo -e "${RED}配置文件写入失败，请检查 jq 是否可用。${PLAIN}"
         return 1
+    fi
+
+    if [[ $ENABLE_ARGO -eq 1 ]]; then
+        save_argo_state "$argo_mode" "$argo_public_domain" "$argo_edge_ip" || {
+            echo -e "${RED}Argo 状态写入失败。${PLAIN}"
+            return 1
+        }
+        if [[ $argo_named -eq 1 ]]; then
+            # 内置 cloudflared 的 token 写在 config.json 中
+            chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+        fi
     fi
 
     echo -e "${GREEN}配置文件生成并写入成功！${PLAIN}"
@@ -1262,7 +1914,7 @@ show_start_failure() {
     service_logs_recent
     local port_regex
     port_regex=$(jq -r '[.inbounds[]? | (.port // .listen_port)] | map(tostring) | join("|")' "$CONFIG_FILE" 2>/dev/null)
-    [[ -z "$port_regex" || "$port_regex" == "null" ]] && port_regex="${DEFAULT_SS_PORT}|${DEFAULT_REALITY_PORT}|${DEFAULT_VMESS_WS_PORT}|${DEFAULT_HY2_PORT}"
+    [[ -z "$port_regex" || "$port_regex" == "null" ]] && port_regex="${DEFAULT_SS_PORT}|${DEFAULT_REALITY_PORT}|${DEFAULT_VMESS_WS_PORT}|${DEFAULT_HY2_PORT}|${DEFAULT_ARGO_WS_PORT}"
     echo -e "${YELLOW}可依次执行：sb test、ss -lntup | grep -E ':(${port_regex})'、sb log 进行排查。${PLAIN}"
 }
 
@@ -1271,6 +1923,9 @@ start_service() {
     test_config || return 1
     if service_start; then
         echo -e "${GREEN}sing-box 服务已启动。${PLAIN}"
+        if argo_is_quick; then
+            argo_external_start || echo -e "${YELLOW}Argo 外部 cloudflared 启动异常，请执行 'sb argo log' 排查。${PLAIN}"
+        fi
         check_status
     else
         show_start_failure
@@ -1279,6 +1934,9 @@ start_service() {
 }
 
 stop_service() {
+    if argo_is_quick; then
+        argo_external_stop
+    fi
     service_stop
     echo -e "${YELLOW}sing-box 已停止。${PLAIN}"
 }
@@ -1287,6 +1945,9 @@ restart_service() {
     test_config || return 1
     if service_restart; then
         echo -e "${GREEN}sing-box 已重启。${PLAIN}"
+        if argo_is_quick; then
+            argo_external_restart || echo -e "${YELLOW}Argo 外部 cloudflared 重启异常，请执行 'sb argo log' 排查。${PLAIN}"
+        fi
         check_status
     else
         show_start_failure
@@ -1300,6 +1961,30 @@ check_status() {
     else
         echo -e "运行状态: ${RED}未运行 (Inactive)${PLAIN}"
         echo -e "${YELLOW}提示: 若启动失败，可运行 'sb test' 查看具体配置报错信息。${PLAIN}"
+    fi
+
+    if argo_is_configured; then
+        local mode domain
+        mode=$(argo_mode)
+        domain=$(argo_domain)
+        if [[ "$mode" == "quick" ]]; then
+            if [[ -z "$domain" ]] && argo_service_is_active; then
+                domain=$(refresh_argo_domain_from_log 2>/dev/null || true)
+            fi
+            if argo_service_is_active; then
+                echo -e "Argo 隧道: ${GREEN}运行中${PLAIN} (quick, 外部 cloudflared) ${CYAN}${domain:-域名待生成}${PLAIN}"
+            else
+                echo -e "Argo 隧道: ${RED}未运行${PLAIN} (quick, 外部 cloudflared)"
+            fi
+        elif [[ "$mode" == "named" ]]; then
+            if service_is_active; then
+                echo -e "Argo 隧道: ${GREEN}运行中${PLAIN} (named, sing-box 内置) ${CYAN}${domain:-未配置域名}${PLAIN}"
+            else
+                echo -e "Argo 隧道: ${RED}未运行${PLAIN} (named, sing-box 内置)"
+            fi
+        else
+            echo -e "Argo 隧道: ${YELLOW}模式配置缺失${PLAIN}"
+        fi
     fi
 }
 
@@ -1406,9 +2091,12 @@ uninstall_all() {
     [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
 
     service_remove
+    argo_service_remove
 
     rm -f "${INSTALL_DIR}/sing-box"
     rm -f "$CLI_TARGET"
+    rm -f "$ARGO_BIN" "$ARGO_LOG"
+    rm -rf "$ARGO_DIR"
 
     read -rp "是否删除配置文件与证书目录 (${CONFIG_DIR})？[y/N]: " del_cfg </dev/tty
     [[ "$del_cfg" =~ ^[Yy]$ ]] && rm -rf "$CONFIG_DIR"
@@ -1454,10 +2142,11 @@ ${GREEN}sing-box 服务管理工具 (sb)${PLAIN}
  9. 重新生成入站配置 (gen)
 10. 更新 sing-box 内核 (update)
 11. BBR 状态与网络调优 (bbr)
-12. 卸载 sing-box (uninstall)
+12. Argo 隧道管理 (argo)
+13. 卸载 sing-box (uninstall)
  0. 退出
 ------------------------"
-    read -rp "请输入选项 [0-12]: " choice </dev/tty
+    read -rp "请输入选项 [0-13]: " choice </dev/tty
     case "$choice" in
         1) start_service ;;
         2) stop_service ;;
@@ -1467,10 +2156,11 @@ ${GREEN}sing-box 服务管理工具 (sb)${PLAIN}
         6) view_inbound_info ;;
         7) test_config ;;
         8) edit_config ;;
-        9) generate_production_config ;;
+        9) generate_production_config && apply_argo_configuration ;;
         10) update_core ;;
         11) manage_bbr ;;
-        12) uninstall_all ;;
+        12) argo_menu ;;
+        13) uninstall_all ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效！${PLAIN}" ;;
     esac
@@ -1487,7 +2177,8 @@ main() {
         info) view_inbound_info ;;
         check|test) test_config ;;
         edit) edit_config ;;
-        gen) generate_production_config ;;
+        gen) generate_production_config && apply_argo_configuration ;;
+        argo) shift; argo_command "$@" ;;
         update) update_core ;;
         bbr) manage_bbr ;;
         uninstall) uninstall_all ;;
@@ -1515,7 +2206,11 @@ main() {
                 if [[ $ENABLE_HY2 -eq 1 ]]; then
                     check_port_available "$HY2_PORT" udp || exit 1
                 fi
+                if [[ $ENABLE_ARGO -eq 1 ]]; then
+                    check_port_available "$ARGO_WS_PORT" tcp || exit 1
+                fi
 
+                apply_argo_configuration || exit 1
                 setup_service
                 install_cli
 
@@ -1529,6 +2224,7 @@ main() {
                 echo -e " 配置文件: ${CONFIG_FILE}"
                 echo -e " 证书目录: ${CERT_DIR}/"
                 echo -e " 查看节点信息: ${YELLOW}sb info${PLAIN}"
+                echo -e " Argo 管理:    ${YELLOW}sb argo${PLAIN}"
                 echo -e " 全局管理工具: ${YELLOW}sb${PLAIN}"
                 if [[ $ENABLE_VMESS -eq 1 || $ENABLE_HY2 -eq 1 ]] && is_self_signed_cert; then
                     echo -e " 当前使用自签证书，请替换为正式证书后再对外提供服务。"
