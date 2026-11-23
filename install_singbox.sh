@@ -25,6 +25,7 @@ INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/sing-box"
 CERT_DIR="${CONFIG_DIR}/cert"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
+LINKS_FILE="${CONFIG_DIR}/links.txt"
 SYSTEMD_FILE="/etc/systemd/system/sing-box.service"
 INITD_FILE="/etc/init.d/sing-box"
 SERVICE_NAME="sing-box"
@@ -329,20 +330,30 @@ refresh_argo_domain_from_log() {
 }
 
 wait_for_argo_domain() {
-    local waited=0 domain=""
-    while [[ $waited -lt 30 ]]; do
-        if domain=$(refresh_argo_domain_from_log); then
-            echo -e "${GREEN}Argo Quick Tunnel 域名: ${domain}${PLAIN}"
-            return 0
+    local max_rotations="${1:-2}" rotation=1 waited=0 domain=""
+    while [[ $rotation -le $max_rotations ]]; do
+        waited=0
+        while [[ $waited -lt 20 ]]; do
+            if domain=$(refresh_argo_domain_from_log); then
+                echo -e "${GREEN}Argo Quick Tunnel 域名: ${domain}${PLAIN}"
+                return 0
+            fi
+            if ! argo_service_is_active; then
+                echo -e "${YELLOW}cloudflared 未保持运行，准备重启...${PLAIN}"
+                break
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if [[ $rotation -lt $max_rotations ]]; then
+            echo -e "${YELLOW}Argo 域名获取超时，正在重启 cloudflared 重试 (${rotation}/${max_rotations})...${PLAIN}"
+            : > "$ARGO_LOG" 2>/dev/null || true
+            argo_service_restart >/dev/null 2>&1 || true
+            sleep 2
         fi
-        if ! argo_service_is_active; then
-            echo -e "${RED}cloudflared 未保持运行，请执行 'sb argo log' 查看日志。${PLAIN}"
-            return 1
-        fi
-        sleep 1
-        waited=$((waited + 1))
+        rotation=$((rotation + 1))
     done
-    echo -e "${YELLOW}等待 Argo 域名超时，请稍后执行 'sb argo info' 或 'sb argo log' 查看。${PLAIN}"
+    echo -e "${RED}多次重试仍未获取 Argo 域名，请执行 'sb argo log' 查看日志。${PLAIN}"
     return 1
 }
 
@@ -511,7 +522,9 @@ argo_status() {
 view_argo_info() {
     argo_is_configured || return 1
 
-    local mode domain port path uuid
+    local mode domain port path uuid location_label="${1:-}" argo_node_name
+    [[ -z "$location_label" ]] && location_label=$(detect_location_label "$(argo_edge_ip)")
+    argo_node_name=$(node_name_with_location "sing-box-VMess-Argo" "$location_label")
     mode=$(argo_mode)
     port=$(argo_ws_port)
     path=$(argo_ws_path)
@@ -542,7 +555,7 @@ view_argo_info() {
 
     local argo_vmess_json argo_link
     argo_vmess_json=$(jq -cn \
-        --arg ps "sing-box-VMess-Argo" \
+        --arg ps "$argo_node_name" \
         --arg add "$domain" \
         --argjson port 443 \
         --arg id "$uuid" \
@@ -558,7 +571,7 @@ view_argo_info() {
     echo -e "  ${YELLOW}${argo_link}${PLAIN}"
     echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
     jq -n \
-        --arg name "sing-box-VMess-Argo" \
+        --arg name "$argo_node_name" \
         --arg server "$domain" \
         --argjson port 443 \
         --arg uuid "$uuid" \
@@ -958,16 +971,97 @@ download_singbox() {
     echo -e "${GREEN}sing-box 二进制已就绪：${INSTALL_DIR}/sing-box${PLAIN}"
 }
 
-# 查看当前入站配置与分享链接
+# 随机高位端口，避免与其他部署或常用端口撞车
+random_free_port() {
+    local port attempt
+    for attempt in $(seq 1 50); do
+        port=$(( (RANDOM % 30000) + 20000 ))
+        if ! ss -H -ltn 2>/dev/null | awk -v p="$port" '$4 ~ (":" p "$") { found=1 } END { exit !found }'; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+    done
+    printf '%s\n' "$(( (RANDOM % 20000) + 40000 ))"
+}
+
+# 随机 WS 路径，避免所有部署共用同一路径指纹
+random_ws_path() {
+    local suffix
+    suffix=$(openssl rand -hex 6 2>/dev/null || head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    printf '/%s\n' "$suffix"
+}
+
+# 将 Cloudflare 元数据格式化为节点备注标签 (例如 US-LosAngeles-AS13335)
+location_label_from_meta() {
+    jq -r '
+        [ (.country // ""), (.city // ""),
+          (if (.asn // "") != "" then ("AS" + (.asn | tostring)) else "" end) ]
+        | map(select(length > 0)) | join("-")' 2>/dev/null |
+        tr -c 'A-Za-z0-9._-' '_' | sed 's/_*$//'
+}
+
+detect_location_label() {
+    local family="${1:-4}" ip_flag="--ipv4" meta=""
+    [[ "$family" == "6" ]] && ip_flag="--ipv6"
+    meta=$(curl -s "$ip_flag" --max-time 4 https://speed.cloudflare.com/meta 2>/dev/null || true)
+    [[ -z "$meta" ]] && return 0
+    location_label_from_meta <<<"$meta"
+}
+
+node_name_with_location() {
+    local base="$1" label="$2"
+    if [[ -n "$label" ]]; then
+        printf '%s-%s\n' "$base" "$label"
+    else
+        printf '%s\n' "$base"
+    fi
+}
+
+# 查看当前入站配置与分享链接（同时写入 links.txt）
 view_inbound_info() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}未找到配置文件: ${CONFIG_FILE}，请先执行安装或生成配置！${PLAIN}"
         return 1
     fi
 
-    echo -e "\n${YELLOW}正在解析配置文件与服务器公网 IP...${PLAIN}"
-    local server_ip
-    server_ip=$(curl -s4m 6 https://api.ipify.org || curl -s4m 6 https://ip.sb || echo "YOUR_SERVER_IP")
+    local output status plain
+    output=$(render_inbound_info)
+    status=$?
+    printf '%s\n' "$output"
+
+    plain=$(printf '%s\n' "$output" | sed -E $'s/\x1b\\[[0-9;]*[mK]//g')
+    mkdir -p "$CONFIG_DIR" 2>/dev/null
+    if (umask 077; {
+        printf '# 节点信息（由 sb info 生成，%s）\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf '# 刷新并查看: sb info    仅查看已保存内容: sb links\n'
+        if argo_is_quick; then
+            printf '# 注意: Quick Tunnel 域名会随 cloudflared 重启变化，请重新执行 sb info。\n'
+        fi
+        printf '\n%s\n' "$plain"
+    } > "$LINKS_FILE"); then
+        chmod 600 "$LINKS_FILE" 2>/dev/null || true
+        echo -e "${YELLOW}节点信息已保存: ${LINKS_FILE}（权限 600）${PLAIN}"
+    else
+        echo -e "${YELLOW}警告: 无法写入 ${LINKS_FILE}${PLAIN}"
+    fi
+    return "$status"
+}
+
+# 渲染入站配置与分享链接（内部使用）
+render_inbound_info() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}未找到配置文件: ${CONFIG_FILE}，请先执行安装或生成配置！${PLAIN}"
+        return 1
+    fi
+
+    local server_ip location_label meta
+    meta=$(curl -s --ipv4 --max-time 4 https://speed.cloudflare.com/meta 2>/dev/null || true)
+    [[ -z "$meta" ]] && meta=$(curl -s --ipv6 --max-time 4 https://speed.cloudflare.com/meta 2>/dev/null || true)
+    server_ip=$(jq -r '.clientIp // empty' <<<"$meta" 2>/dev/null || true)
+    location_label=$(location_label_from_meta <<<"$meta")
+    if [[ -z "$server_ip" ]]; then
+        server_ip=$(curl -s4m 6 https://api.ipify.org || curl -s4m 6 https://ip.sb || echo "YOUR_SERVER_IP")
+    fi
 
     # 解析 Reality 入站
     local r_tag
@@ -1002,12 +1096,16 @@ view_inbound_info() {
     echo -e "\n${CYAN}================================================================${PLAIN}"
     echo -e "${CYAN}                     当前入站节点配置详情                       ${PLAIN}"
     echo -e "${CYAN}================================================================${PLAIN}"
+    if [[ -n "$location_label" ]]; then
+        echo -e "${CYAN}出口识别: ${location_label}${PLAIN}"
+    fi
 
     if [[ -n "$ss_tag" ]]; then
-        local ss_port ss_method ss_password
+        local ss_port ss_method ss_password ss_node_name
         ss_port=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .listen_port' "$CONFIG_FILE")
         ss_method=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .method' "$CONFIG_FILE")
         ss_password=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .password' "$CONFIG_FILE")
+        ss_node_name=$(node_name_with_location "sing-box-Shadowsocks" "$location_label")
 
         echo -e "${GREEN}【协议: Shadowsocks (SS2022)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${server_ip}${PLAIN}"
@@ -1018,12 +1116,12 @@ view_inbound_info() {
         # SIP002: ss://base64url(method:password)@host:port#tag
         local ss_userinfo ss_link
         ss_userinfo=$(printf '%s' "${ss_method}:${ss_password}" | base64 | tr '+/' '-_' | tr -d '=\n')
-        ss_link="ss://${ss_userinfo}@${server_ip}:${ss_port}#sing-box-Shadowsocks"
+        ss_link="ss://${ss_userinfo}@${server_ip}:${ss_port}#${ss_node_name}"
         echo -e "  分享链接 (Link):"
         echo -e "  ${YELLOW}${ss_link}${PLAIN}"
         echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
         jq -n \
-            --arg name "sing-box-Shadowsocks" \
+            --arg name "$ss_node_name" \
             --arg server "$server_ip" \
             --argjson port "$ss_port" \
             --arg cipher "$ss_method" \
@@ -1041,13 +1139,14 @@ view_inbound_info() {
     fi
 
     if [[ -n "$r_tag" ]]; then
-        local r_port r_uuid r_flow r_sni r_pri r_sid r_pub
+        local r_port r_uuid r_flow r_sni r_pri r_sid r_pub r_node_name
         r_port=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .listen_port' "$CONFIG_FILE")
         r_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .users[0].uuid' "$CONFIG_FILE")
         r_flow=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .users[0].flow' "$CONFIG_FILE")
         r_sni=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tls.server_name' "$CONFIG_FILE")
         r_pri=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tls.reality.private_key' "$CONFIG_FILE")
         r_sid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .tls.reality.short_id[0]' "$CONFIG_FILE")
+        r_node_name=$(node_name_with_location "sing-box-Reality" "$location_label")
         
         # sing-box 没有“由私钥推导公钥”的命令，只能依赖生成配置时留存的公钥文件
         r_pub=""
@@ -1067,7 +1166,7 @@ view_inbound_info() {
         echo -e "  Short ID:           ${CYAN}${r_sid}${PLAIN}"
         
         if [[ -n "$r_pub" ]]; then
-            local r_link="vless://${r_uuid}@${server_ip}:${r_port}?security=reality&encryption=none&pbk=${r_pub}&headerType=none&type=tcp&flow=${r_flow}&sni=${r_sni}&sid=${r_sid}#VLESS-Reality"
+            local r_link="vless://${r_uuid}@${server_ip}:${r_port}?security=reality&encryption=none&pbk=${r_pub}&headerType=none&type=tcp&flow=${r_flow}&sni=${r_sni}&sid=${r_sid}#${r_node_name}"
             echo -e "  分享链接 (Link):"
             echo -e "  ${YELLOW}${r_link}${PLAIN}"
         else
@@ -1078,11 +1177,12 @@ view_inbound_info() {
     fi
 
     if [[ -n "$ws_tag" ]]; then
-        local ws_port ws_uuid ws_sni ws_path
+        local ws_port ws_uuid ws_sni ws_path ws_node_name
         ws_port=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .listen_port' "$CONFIG_FILE")
         ws_uuid=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .users[0].uuid' "$CONFIG_FILE")
         ws_sni=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .tls.server_name' "$CONFIG_FILE")
         ws_path=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .transport.path' "$CONFIG_FILE")
+        ws_node_name=$(node_name_with_location "sing-box-VMess-WS-TLS" "$location_label")
 
         echo -e "${GREEN}【协议: VMess + WS + TLS (支持 CDN 回源)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${ws_sni} (或填服务器 IP / CDN 优选 IP)${PLAIN}"
@@ -1097,7 +1197,7 @@ view_inbound_info() {
         # vmess:// 分享链接 = base64(标准 vmess 节点 JSON)
         local ws_vmess_json ws_link
         ws_vmess_json=$(jq -cn \
-            --arg ps "sing-box-VMess-WS-TLS" \
+            --arg ps "$ws_node_name" \
             --arg add "$ws_sni" \
             --argjson port "$ws_port" \
             --arg id "$ws_uuid" \
@@ -1112,7 +1212,7 @@ view_inbound_info() {
         echo -e "  ${YELLOW}${ws_link}${PLAIN}"
         echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
         jq -n \
-            --arg name "sing-box-VMess-WS-TLS" \
+            --arg name "$ws_node_name" \
             --arg server "$ws_sni" \
             --argjson port "$ws_port" \
             --arg id "$ws_uuid" \
@@ -1140,8 +1240,9 @@ view_inbound_info() {
     fi
 
     if [[ -n "$hy2_tag" ]]; then
-        local hy2_port hy2_password hy2_sni hy2_insecure=0
+        local hy2_port hy2_password hy2_sni hy2_insecure=0 hy2_node_name
         hy2_port=$(jq -r '.inbounds[] | select(.tag=="hysteria2-in") | .listen_port' "$CONFIG_FILE")
+        hy2_node_name=$(node_name_with_location "sing-box-Hysteria2" "$location_label")
         hy2_password=$(jq -r '.inbounds[] | select(.tag=="hysteria2-in") | .users[0].password' "$CONFIG_FILE")
 
         hy2_sni=$(jq -r '.inbounds[] | select(.tag=="hysteria2-in") | (.tls.server_name // "")' "$CONFIG_FILE")
@@ -1169,12 +1270,12 @@ view_inbound_info() {
 
         local hy2_link="hysteria2://${hy2_password}@${server_ip}:${hy2_port}/?sni=${hy2_sni}"
         [[ $hy2_insecure -eq 1 ]] && hy2_link+="&insecure=1"
-        hy2_link+="#sing-box-Hysteria2"
+        hy2_link+="#${hy2_node_name}"
         echo -e "  分享链接 (Link):"
         echo -e "  ${YELLOW}${hy2_link}${PLAIN}"
         echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
         jq -n \
-            --arg name "sing-box-Hysteria2" \
+            --arg name "$hy2_node_name" \
             --arg server "$server_ip" \
             --argjson port "$hy2_port" \
             --arg password "$hy2_password" \
@@ -1193,7 +1294,7 @@ view_inbound_info() {
     fi
 
     if [[ -n "$argo_tag" ]]; then
-        view_argo_info
+        view_argo_info "$location_label"
     fi
 
     # 住宅 IP 出站
@@ -1249,7 +1350,7 @@ select_inbound_protocols() {
         echo -e "  ${GREEN}2)${PLAIN} VLESS + Reality  ${YELLOW}默认端口 ${DEFAULT_REALITY_PORT}${PLAIN}"
         echo -e "  ${GREEN}3)${PLAIN} VMess + WS + TLS ${YELLOW}默认端口 ${DEFAULT_VMESS_WS_PORT}${PLAIN}"
         echo -e "  ${GREEN}4)${PLAIN} Hysteria2        ${YELLOW}默认端口 ${DEFAULT_HY2_PORT} (UDP)，QUIC${PLAIN}"
-        echo -e "  ${GREEN}5)${PLAIN} Argo 隧道        ${YELLOW}本地明文 VMess-WS(默认 ${DEFAULT_ARGO_WS_PORT}) + quick/named${PLAIN}"
+        echo -e "  ${GREEN}5)${PLAIN} Argo 隧道        ${YELLOW}本地明文 VMess-WS(默认随机高位端口) + quick/named${PLAIN}"
         read -rp "请输入编号（多个用空格或逗号分隔，输入 all 全选）: " input </dev/tty || return 1
         input=$(printf '%s' "$input" | tr ',' ' ')
 
@@ -1330,7 +1431,7 @@ configure_inbound_ports() {
     REALITY_PORT="$DEFAULT_REALITY_PORT"
     VMESS_WS_PORT="$DEFAULT_VMESS_WS_PORT"
     HY2_PORT="$DEFAULT_HY2_PORT"
-    ARGO_WS_PORT="$DEFAULT_ARGO_WS_PORT"
+    ARGO_WS_PORT=$(random_free_port)
     SELECTED_PORTS=()
 
     if [[ $ENABLE_SS -eq 1 ]]; then
@@ -1350,6 +1451,9 @@ configure_inbound_ports() {
         SELECTED_PORTS+=("$HY2_PORT")
     fi
     if [[ $ENABLE_ARGO -eq 1 ]]; then
+        while port_in_selected "$ARGO_WS_PORT"; do
+            ARGO_WS_PORT=$(random_free_port)
+        done
         ARGO_WS_PORT=$(prompt_inbound_port "Argo 本地 WS (仅 127.0.0.1)" "$ARGO_WS_PORT")
         SELECTED_PORTS+=("$ARGO_WS_PORT")
     fi
@@ -1456,6 +1560,14 @@ generate_production_config() {
     select_inbound_protocols || return 1
     configure_inbound_ports
     configure_residential_outbound
+
+    # 每次生成配置都使用随机 WS 路径，避免固定路径指纹
+    if [[ $ENABLE_VMESS -eq 1 ]]; then
+        VMESS_WS_PATH=$(random_ws_path)
+    fi
+    if [[ $ENABLE_ARGO -eq 1 ]]; then
+        ARGO_WS_PATH=$(random_ws_path)
+    fi
 
     local ws_domain=""
     if [[ $ENABLE_VMESS -eq 1 || $ENABLE_HY2 -eq 1 ]]; then
@@ -1925,6 +2037,7 @@ start_service() {
         echo -e "${GREEN}sing-box 服务已启动。${PLAIN}"
         if argo_is_quick; then
             argo_external_start || echo -e "${YELLOW}Argo 外部 cloudflared 启动异常，请执行 'sb argo log' 排查。${PLAIN}"
+            refresh_links_quiet
         fi
         check_status
     else
@@ -1947,6 +2060,7 @@ restart_service() {
         echo -e "${GREEN}sing-box 已重启。${PLAIN}"
         if argo_is_quick; then
             argo_external_restart || echo -e "${YELLOW}Argo 外部 cloudflared 重启异常，请执行 'sb argo log' 排查。${PLAIN}"
+            refresh_links_quiet
         fi
         check_status
     else
@@ -2126,6 +2240,24 @@ install_cli() {
     echo -e "${GREEN}快捷命令 'sb' 部署完成。${PLAIN}"
 }
 
+# 查看已保存的节点链接（不重新探测网络）
+view_saved_links() {
+    if [[ ! -s "$LINKS_FILE" ]]; then
+        echo -e "${YELLOW}尚未生成链接文件，请先执行 'sb info'。${PLAIN}"
+        return 1
+    fi
+    if argo_is_quick; then
+        echo -e "${YELLOW}提示: quick 模式域名可能已变化，建议执行 'sb info' 重新生成。${PLAIN}"
+    fi
+    cat "$LINKS_FILE"
+}
+
+# 静默刷新 links.txt（例如 Argo quick 域名生成之后）
+refresh_links_quiet() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    view_inbound_info >/dev/null 2>&1 || true
+}
+
 # 交互主菜单
 show_menu() {
     echo -e "
@@ -2144,9 +2276,10 @@ ${GREEN}sing-box 服务管理工具 (sb)${PLAIN}
 11. BBR 状态与网络调优 (bbr)
 12. Argo 隧道管理 (argo)
 13. 卸载 sing-box (uninstall)
+14. 查看已保存节点链接 (links)
  0. 退出
 ------------------------"
-    read -rp "请输入选项 [0-13]: " choice </dev/tty
+    read -rp "请输入选项 [0-14]: " choice </dev/tty
     case "$choice" in
         1) start_service ;;
         2) stop_service ;;
@@ -2161,6 +2294,7 @@ ${GREEN}sing-box 服务管理工具 (sb)${PLAIN}
         11) manage_bbr ;;
         12) argo_menu ;;
         13) uninstall_all ;;
+        14) view_saved_links ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效！${PLAIN}" ;;
     esac
@@ -2175,6 +2309,7 @@ main() {
         status) check_status ;;
         log) view_logs ;;
         info) view_inbound_info ;;
+        links) view_saved_links ;;
         check|test) test_config ;;
         edit) edit_config ;;
         gen) generate_production_config && apply_argo_configuration ;;
@@ -2224,6 +2359,7 @@ main() {
                 echo -e " 配置文件: ${CONFIG_FILE}"
                 echo -e " 证书目录: ${CERT_DIR}/"
                 echo -e " 查看节点信息: ${YELLOW}sb info${PLAIN}"
+                echo -e " 已保存链接:   ${YELLOW}${LINKS_FILE}${PLAIN} (${YELLOW}sb links${PLAIN})"
                 echo -e " Argo 管理:    ${YELLOW}sb argo${PLAIN}"
                 echo -e " 全局管理工具: ${YELLOW}sb${PLAIN}"
                 if [[ $ENABLE_VMESS -eq 1 || $ENABLE_HY2 -eq 1 ]] && is_self_signed_cert; then

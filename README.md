@@ -67,10 +67,10 @@ sing-box / WARP 同理，把文件名换成 `install_singbox.sh` / `install_warp
 | --- | --- | --- | --- | --- |
 | 1 | Xray / sing-box | Shadowsocks | 32443 | 加密方式 `2022-blake3-aes-128-gcm`，密码自动生成 |
 | 2 | Xray / sing-box | VLESS + Reality | 443 | `xtls-rprx-vision`，自动测速选择伪装目标 |
-| 3 | Xray / sing-box | VMess + WS + TLS | 2053 | WS 路径 `/175443`，支持 CDN 回源 |
+| 3 | Xray / sing-box | VMess + WS + TLS | 2053 | WS 路径每次生成时随机，支持 CDN 回源 |
 | 4 | sing-box | Hysteria2 | 8443/UDP | QUIC，密码自动生成 |
-| 4 | Xray | Argo 隧道 | 本地 WS 2083 | 明文 VMess-WS + 外部 cloudflared，支持 quick / named |
-| 5 | sing-box | Argo 隧道 | 本地 WS 2083 | quick 用外部 cloudflared；named 用 sing-box 内置 cloudflared |
+| 4 | Xray | Argo 隧道 | 本地 WS 随机高位端口 | 明文 VMess-WS + 外部 cloudflared，支持 quick / named / local |
+| 5 | sing-box | Argo 隧道 | 本地 WS 随机高位端口 | quick 用外部 cloudflared；named 用 sing-box 内置 cloudflared |
 
 输入方式：
 
@@ -103,16 +103,18 @@ Hysteria2 复用 `/etc/sing-box/cert/` 下的证书：
 
 ### Xray Argo 隧道
 
-Xray 的第 4 项会在本机启动一个仅监听 `127.0.0.1` 的明文 VMess-WS 入站，再由外部 `cloudflared` 通过 Cloudflare Argo 隧道对外提供服务。支持两种模式：
+Xray 的第 4 项会在本机启动一个仅监听 `127.0.0.1` 的明文 VMess-WS 入站，再由外部 `cloudflared` 通过 Cloudflare Argo 隧道对外提供服务。支持三种模式：
 
 - **quick**：使用随机 `*.trycloudflare.com` 域名，无需 Cloudflare 账号；cloudflared 每次重启后域名都会变化。
-- **named**：使用 Cloudflare Zero Trust 的 Tunnel Token，域名固定；需要在 Cloudflare 面板把 Public Hostname 指向 `http://127.0.0.1:<本地 WS 端口>`。
+- **named**：使用 Cloudflare Zero Trust 的 Tunnel Token，域名固定；需要在 Cloudflare 面板创建隧道，并把 Public Hostname 指向 `http://127.0.0.1:<本地 WS 端口>`。
+- **local**：使用 `cloudflared` CLI 托管隧道。脚本会引导完成一次浏览器授权，自动创建/复用隧道、写入 DNS 记录并生成 `config.yml`，域名固定，不需要面板配置。
 
 配置流程会询问：
 
-1. Argo 模式（quick / named）
+1. Argo 模式（quick / named / local）
 2. cloudflared 连接 Cloudflare 边缘使用 IPv4 还是 IPv6
-3. named 模式额外询问 Tunnel Token 和公开域名
+3. named / local 模式额外询问公开域名
+4. named 模式询问 Tunnel Token；local 模式执行浏览器授权、创建隧道并绑定 DNS
 
 安装后管理：
 
@@ -120,6 +122,7 @@ Xray 的第 4 项会在本机启动一个仅监听 `127.0.0.1` 的明文 VMess-W
 xr argo            # 交互菜单
 xr argo status     # 查看模式、域名、服务状态
 xr argo info       # 查看 Argo 节点链接
+xr argo bind       # local 模式：绑定/改绑固定域名（可传域名参数）
 xr argo restart    # 重启隧道（quick 模式会生成新域名）
 xr argo log        # 查看 cloudflared 日志
 xr argo update     # 更新 cloudflared
@@ -134,6 +137,16 @@ xr argo uninstall  # 仅卸载 Argo
 - Argo 只代理 HTTP/WebSocket/TCP，不能转发 Hysteria2 等 UDP 协议
 - 服务器不需要放行 Argo 入站端口，但需要能出站访问 Cloudflare
 - named 模式的 Token 保存在 `/etc/xray/argo/token`（权限 `600`）
+- local 模式的状态保存在 `/etc/xray/argo/`：`tunnel_name`、`tunnel_uuid`、`credentials_file`、`origin_cert`、`config.yml`
+- local 模式的隧道名为 `xray-<域名转换>`；复用已有隧道前会检查本机凭证文件，缺失时只提示、不会自动删除云端隧道
+- local 模式绑定 DNS 时，如果记录已存在，必须手动确认才会加 `--overwrite-dns`
+- 授权文件默认在 `/root/.cloudflared/cert.pem`，权限 `600`；换机器时可复制该目录跳过再次授权（也可用 `TUNNEL_ORIGIN_CERT` 指定路径）
+- local 模式创建的是云端资源；如果中途取消或本机配置写入失败，隧道/DNS 记录不会自动回收，需要在 Cloudflare 面板手动清理
+- 同一域名重复绑定会复用同名隧道；换域名会新建一个 `xray-<新域名>` 隧道，避免覆盖旧绑定
+- 卸载只清理本机服务和状态，云端隧道与 DNS 记录会保留；按提示执行 `cloudflared tunnel delete <name>` 才会删除
+- 本地 WS 端口默认随机高位，WS 路径在每次 `xr gen` 时随机生成
+- quick 模式启动后会轮询日志等待域名；20 秒未获取到会自动重启 cloudflared 重试一次
+- named / local 模式启动后会轮询日志确认连接已注册，而不是固定等待几秒
 - 修改 Argo 模式或端口后执行 `xr gen`，再执行 `xr restart` 使配置生效
 
 ### sing-box Argo 隧道
@@ -176,6 +189,8 @@ sb argo uninstall  # 仅卸载 Argo 外部服务与状态
 - named 的 Token 写入 `/etc/sing-box/config.json`，脚本会将该文件权限设为 `600`
 - named 模式会自动添加路由规则，放行内置 cloudflared 对 `127.0.0.1` 的连接，避免被 `ip_is_private` 规则拒绝
 - quick 支持架构：x86_64、arm64、armv7、i386；named 的架构随 sing-box
+- 本地 WS 端口默认随机高位，WS 路径在每次 `sb gen` 时随机生成
+- quick 模式启动后会轮询日志等待域名；20 秒未获取到会自动重启 cloudflared 重试一次
 - Argo 只代理 HTTP/WebSocket/TCP，不能转发 Hysteria2 等 UDP 协议
 - 服务器不需要放行 Argo 入站端口，但需要能出站访问 Cloudflare
 - 修改 Argo 模式或端口后执行 `sb gen`，再执行 `sb restart` 使配置生效
@@ -276,13 +291,14 @@ warp        # WireProxy-WARP 交互菜单
 | `restart` | ✅ | ✅ | 重启服务 |
 | `status` | ✅ | ✅ | 查看运行状态 |
 | `log` | ✅ | ✅ | 实时查看日志 |
-| `info` | ✅ | ✅ | 查看入站节点信息 |
+| `info` | ✅ | ✅ | 查看入站节点信息（并刷新 `links.txt`） |
+| `links` | ✅ | ✅ | 查看已保存的节点链接（不重新探测网络） |
 | `check` / `test` | ✅ | ✅ | 检查配置文件 |
 | `edit` | ✅ | ✅ | 编辑配置并可选重启 |
 | `gen` | ✅ | ✅ | 重新选择协议并生成配置 |
 | `bbr` | ✅ | ✅ | 查看/重新应用 BBR 优化 |
 | `update` | ❌ | ✅ | 更新 sing-box 内核 |
-| `argo` | ✅ | ✅ | 管理 Argo 隧道（status/info/start/stop/restart/log/update/uninstall） |
+| `argo` | ✅ | ✅ | 管理 Argo 隧道（status/info/start/stop/restart/log/update/uninstall）；Xray 额外支持 `argo bind` |
 | `uninstall` | ✅ | ✅ | 卸载脚本与内核 |
 
 Xray 启用 Argo quick 后，`xr start` / `xr stop` / `xr restart` / `xr status` 会同时管理 Xray 和外部 cloudflared；sing-box quick 模式同理。sing-box named 模式的 cloudflared 内置于 sing-box，随 `sb start` / `sb stop` / `sb restart` 一起管理。
@@ -304,9 +320,12 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 `xr info` / `sb info` 会读取当前配置并输出：
 
 - 服务器地址、端口、UUID 或 Shadowsocks 密码
+- 出口识别信息（国家-城市-ASN，来自 `speed.cloudflare.com/meta`，同时追加到节点备注）
 - 分享链接：`vless://`、`vmess://`（含 Argo）、`ss://`、`hysteria2://`
 - Mihomo 可用的节点 JSON（添加到 `proxies` 数组）
 - 启用 Argo 时，`xr info` / `sb info` 会输出当前 quick 域名或 named 固定域名对应的 `vmess://` 链接
+
+输出会同时保存到 `/etc/xray/links.txt` 或 `/etc/sing-box/links.txt`（权限 `600`）。终端断开后可用 `xr links` / `sb links` 直接查看；Argo quick 域名会随 cloudflared 重启变化，此时应重新执行 `xr info` / `sb info` 刷新文件。
 
 ## 证书
 
@@ -337,14 +356,14 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 | VMess + WS + TLS | 2053 | TCP |
 | Shadowsocks | 32443 | TCP + UDP |
 | Hysteria2 | 8443 | UDP |
-| Argo 本地 VMess-WS | 2083 | TCP（仅 `127.0.0.1`） |
+| Argo 本地 VMess-WS | 安装时随机（可自定义） | TCP（仅 `127.0.0.1`） |
 | WireProxy SOCKS5 | 安装时随机 / 自定义 | TCP |
 
 云服务器还需在安全组中放行相同端口。如果生成配置时自定义了端口，请以实际配置为准；`xr info` / `sb info` / `warp info` 会显示最终使用的端口。
 
 Hysteria2 是 UDP/QUIC 协议，除本机防火墙外，云安全组也必须放行对应的 **UDP** 端口。
 
-Argo 本地 VMess-WS 仅监听 `127.0.0.1`，无需放行；对外流量由 cloudflared 主动出站连接 Cloudflare 边缘。Xray 和 sing-box 都默认使用 `2083`，如果在同一台机器同时启用两者的 Argo，需要为其中一个修改本地端口。
+Argo 本地 VMess-WS 仅监听 `127.0.0.1`，无需放行；对外流量由 cloudflared 主动出站连接 Cloudflare 边缘。生成配置时默认分配随机高位端口并生成随机 WS 路径，实际值可从 `xr info` / `sb info` 或配置文件中查看。
 
 WireProxy 仅监听 `127.0.0.1` 时无需放行端口；监听 `0.0.0.0` 时需放行对应 TCP 端口，并建议启用 SOCKS5 用户名/密码认证、限制来源 IP。WARP 本身通过 UDP 连接 CloudFlare Endpoint（默认 2408），无需在服务器上放行入站 UDP。
 

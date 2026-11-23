@@ -26,6 +26,7 @@ INSTALL_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/xray"
 CERT_DIR="${CONFIG_DIR}/cert"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
+LINKS_FILE="${CONFIG_DIR}/links.txt"
 SYSTEMD_FILE="/etc/systemd/system/xray.service"
 INITD_FILE="/etc/init.d/xray"
 SERVICE_NAME="xray"
@@ -57,6 +58,12 @@ ARGO_MODE_FILE="${ARGO_DIR}/mode"
 ARGO_DOMAIN_FILE="${ARGO_DIR}/domain"
 ARGO_TOKEN_FILE="${ARGO_DIR}/token"
 ARGO_EDGE_IP_FILE="${ARGO_DIR}/edge_ip"
+# local 模式（cloudflared CLI 托管隧道）
+ARGO_TUNNEL_NAME_FILE="${ARGO_DIR}/tunnel_name"
+ARGO_TUNNEL_UUID_FILE="${ARGO_DIR}/tunnel_uuid"
+ARGO_CRED_FILE_STATE="${ARGO_DIR}/credentials_file"
+ARGO_ORIGIN_CERT_STATE="${ARGO_DIR}/origin_cert"
+ARGO_CONFIG_YML="${ARGO_DIR}/config.yml"
 ARGO_BIN="/usr/local/bin/cloudflared-argo"
 ARGO_SERVICE_NAME="cloudflared-argo"
 ARGO_SYSTEMD_FILE="/etc/systemd/system/${ARGO_SERVICE_NAME}.service"
@@ -190,22 +197,54 @@ argo_uuid() {
     jq -r '.inbounds[] | select(.tag=="vmess-ws-argo-in") | .settings.clients[0].id' "$CONFIG_FILE" 2>/dev/null
 }
 
+argo_tunnel_name() {
+    [[ -s "$ARGO_TUNNEL_NAME_FILE" ]] && tr -d '[:space:]' < "$ARGO_TUNNEL_NAME_FILE"
+}
+
+argo_tunnel_uuid() {
+    [[ -s "$ARGO_TUNNEL_UUID_FILE" ]] && tr -d '[:space:]' < "$ARGO_TUNNEL_UUID_FILE"
+}
+
+argo_credentials_file() {
+    [[ -s "$ARGO_CRED_FILE_STATE" ]] && tr -d '[:space:]' < "$ARGO_CRED_FILE_STATE"
+}
+
+argo_origin_cert() {
+    [[ -s "$ARGO_ORIGIN_CERT_STATE" ]] && tr -d '[:space:]' < "$ARGO_ORIGIN_CERT_STATE"
+}
+
 save_argo_state() {
     local mode="$1" domain="$2" token="$3" edge_ip="$4"
+    local tunnel_name="${5:-}" tunnel_uuid="${6:-}" cred_file="${7:-}" origin_cert="${8:-}"
     mkdir -p "$ARGO_DIR" || return 1
     chmod 700 "$ARGO_DIR" 2>/dev/null || true
     # 重新生成配置时清空旧日志；保留空文件，避免回退到 journald 读到旧域名
     : > "$ARGO_LOG" 2>/dev/null || true
     printf '%s\n' "$mode" > "$ARGO_MODE_FILE" || return 1
     printf '%s\n' "$edge_ip" > "$ARGO_EDGE_IP_FILE" || return 1
-    if [[ "$mode" == "named" ]]; then
-        printf '%s\n' "$domain" > "$ARGO_DOMAIN_FILE" || return 1
-        (umask 077; printf '%s' "$token" > "$ARGO_TOKEN_FILE") || return 1
-        chmod 600 "$ARGO_TOKEN_FILE" 2>/dev/null || true
-    else
-        : > "$ARGO_DOMAIN_FILE" || return 1
-        rm -f "$ARGO_TOKEN_FILE"
-    fi
+
+    case "$mode" in
+        named)
+            printf '%s\n' "$domain" > "$ARGO_DOMAIN_FILE" || return 1
+            (umask 077; printf '%s' "$token" > "$ARGO_TOKEN_FILE") || return 1
+            chmod 600 "$ARGO_TOKEN_FILE" 2>/dev/null || true
+            rm -f "$ARGO_TUNNEL_NAME_FILE" "$ARGO_TUNNEL_UUID_FILE" \
+                "$ARGO_CRED_FILE_STATE" "$ARGO_ORIGIN_CERT_STATE" "$ARGO_CONFIG_YML"
+            ;;
+        local)
+            printf '%s\n' "$domain" > "$ARGO_DOMAIN_FILE" || return 1
+            printf '%s\n' "$tunnel_name" > "$ARGO_TUNNEL_NAME_FILE" || return 1
+            printf '%s\n' "$tunnel_uuid" > "$ARGO_TUNNEL_UUID_FILE" || return 1
+            printf '%s\n' "$cred_file" > "$ARGO_CRED_FILE_STATE" || return 1
+            printf '%s\n' "$origin_cert" > "$ARGO_ORIGIN_CERT_STATE" || return 1
+            rm -f "$ARGO_TOKEN_FILE"
+            ;;
+        *)
+            : > "$ARGO_DOMAIN_FILE" || return 1
+            rm -f "$ARGO_TOKEN_FILE" "$ARGO_TUNNEL_NAME_FILE" "$ARGO_TUNNEL_UUID_FILE" \
+                "$ARGO_CRED_FILE_STATE" "$ARGO_ORIGIN_CERT_STATE" "$ARGO_CONFIG_YML"
+            ;;
+    esac
 }
 
 clear_argo_state() {
@@ -304,6 +343,134 @@ download_cloudflared() {
     echo -e "${GREEN}cloudflared 已安装: $("$ARGO_BIN" --version 2>/dev/null | head -n 1)${PLAIN}"
 }
 
+# =========================================================
+# local 模式：cloudflared CLI 托管隧道 + 自动绑定 DNS
+# =========================================================
+
+argo_default_cert_path() {
+    printf '%s\n' "${TUNNEL_ORIGIN_CERT:-$HOME/.cloudflared/cert.pem}"
+}
+
+# 确保账号已授权；成功后 BIND_ORIGIN_CERT 指向 cert.pem
+ensure_argo_login() {
+    local cert
+    cert=$(argo_default_cert_path)
+    if [[ -s "$cert" ]]; then
+        chmod 600 "$cert" 2>/dev/null || true
+        BIND_ORIGIN_CERT="$cert"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$cert")" || return 1
+    chmod 700 "$(dirname "$cert")" 2>/dev/null || true
+    echo -e "${YELLOW}需要一次浏览器授权：请复制 cloudflared 输出的链接到本地浏览器打开。${PLAIN}" >&2
+    echo -e "${YELLOW}授权完成后脚本会自动继续。${PLAIN}" >&2
+    if ! "$ARGO_BIN" tunnel login; then
+        echo -e "${RED}cloudflared tunnel login 失败或超时。${PLAIN}" >&2
+        return 1
+    fi
+    if [[ ! -s "$cert" ]]; then
+        echo -e "${RED}未找到授权文件 ${cert}。若使用自定义路径，请设置 TUNNEL_ORIGIN_CERT。${PLAIN}" >&2
+        return 1
+    fi
+    chmod 600 "$cert" 2>/dev/null || true
+    BIND_ORIGIN_CERT="$cert"
+}
+
+default_local_tunnel_name() {
+    local domain="$1"
+    printf 'xray-%s\n' "$(printf '%s' "$domain" | tr '.' '-' | tr -cd 'A-Za-z0-9-' | cut -c1-48)"
+}
+
+# 按名称查找云端隧道 UUID（优先 JSON，失败时解析表格输出）
+find_local_tunnel() {
+    local name="$1" json id=""
+    if json=$("$ARGO_BIN" tunnel list --output json 2>/dev/null) && [[ -n "$json" ]]; then
+        id=$(jq -r --arg n "$name" '
+            (if type == "array" then . else (.tunnels // []) end)[]
+            | select(.name == $n) | .id' <<<"$json" 2>/dev/null | head -n 1)
+    fi
+    if [[ -z "$id" || "$id" == "null" ]]; then
+        id=$("$ARGO_BIN" tunnel list 2>/dev/null | awk -v n="$name" '$2 == n { print $1; exit }')
+    fi
+    if [[ -n "$id" && "$id" != "null" ]]; then
+        printf '%s\n' "$id"
+    fi
+}
+
+# 创建或复用隧道；成功后可读取 BIND_TUNNEL_UUID / BIND_CRED_FILE
+ensure_local_tunnel() {
+    local name="$1" uuid cred
+    uuid=$(find_local_tunnel "$name")
+
+    if [[ -z "$uuid" ]]; then
+        echo -e "${YELLOW}创建 Cloudflare Tunnel: ${name}${PLAIN}" >&2
+        if ! "$ARGO_BIN" tunnel create "$name" >/dev/null 2>&1; then
+            echo -e "${RED}创建隧道失败，请执行 '${ARGO_BIN} tunnel create ${name}' 查看原因。${PLAIN}" >&2
+            return 1
+        fi
+        uuid=$(find_local_tunnel "$name")
+    else
+        echo -e "${YELLOW}复用已有 Cloudflare Tunnel: ${name} (${uuid})${PLAIN}" >&2
+    fi
+
+    if [[ -z "$uuid" ]]; then
+        echo -e "${RED}创建后仍无法获取隧道 UUID，请执行 '${ARGO_BIN} tunnel list' 检查。${PLAIN}" >&2
+        return 1
+    fi
+
+    cred="$HOME/.cloudflared/${uuid}.json"
+    if [[ ! -s "$cred" ]]; then
+        echo -e "${RED}本机缺少凭证文件 ${cred}。${PLAIN}" >&2
+        echo -e "${YELLOW}为避免误删云端隧道，脚本不会自动删除/重建。请在 Cloudflare 面板删除该隧道，或换一个隧道名称。${PLAIN}" >&2
+        return 1
+    fi
+
+    BIND_TUNNEL_UUID="$uuid"
+    BIND_CRED_FILE="$cred"
+}
+
+# 写 DNS 记录；已存在时要求显式确认后才覆盖
+bind_local_dns() {
+    local name="$1" domain="$2" output confirm
+    echo -e "${YELLOW}绑定 DNS: ${domain} -> ${name}${PLAIN}" >&2
+
+    if output=$("$ARGO_BIN" tunnel route dns "$name" "$domain" 2>&1); then
+        [[ -n "$output" ]] && echo "$output" >&2
+        return 0
+    fi
+    [[ -n "$output" ]] && echo "$output" >&2
+
+    if [[ "$output" == *"already exists"* || "$output" == *"record with that host"* ]]; then
+        read -rp "${domain} 已存在 DNS 记录，是否覆盖为 Argo 隧道？[y/N]: " confirm </dev/tty || confirm=""
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            if "$ARGO_BIN" tunnel route dns --overwrite-dns "$name" "$domain"; then
+                return 0
+            fi
+        fi
+        echo -e "${RED}未覆盖现有 DNS 记录，已取消绑定。${PLAIN}" >&2
+    else
+        echo -e "${RED}DNS 绑定失败，请确认域名已托管在当前 Cloudflare 账号下。${PLAIN}" >&2
+    fi
+    return 1
+}
+
+write_local_argo_config() {
+    local uuid="$1" cred="$2" domain="$3" port="$4"
+    mkdir -p "$ARGO_DIR" || return 1
+    chmod 700 "$ARGO_DIR" 2>/dev/null || true
+    cat > "$ARGO_CONFIG_YML" <<EOF
+tunnel: ${uuid}
+credentials-file: ${cred}
+
+ingress:
+  - hostname: ${domain}
+    service: http://127.0.0.1:${port}
+  - service: http_status:404
+EOF
+    chmod 600 "$ARGO_CONFIG_YML" 2>/dev/null || true
+}
+
 argo_recent_logs() {
     if [[ -f "$ARGO_LOG" ]]; then
         tail -n 200 "$ARGO_LOG" 2>/dev/null || true
@@ -324,27 +491,51 @@ refresh_argo_domain_from_log() {
 }
 
 wait_for_argo_domain() {
-    local waited=0 domain=""
-    while [[ $waited -lt 30 ]]; do
-        if domain=$(refresh_argo_domain_from_log); then
-            echo -e "${GREEN}Argo Quick Tunnel 域名: ${domain}${PLAIN}"
+    local max_rotations="${1:-2}" rotation=1 waited=0 domain=""
+    while [[ $rotation -le $max_rotations ]]; do
+        waited=0
+        while [[ $waited -lt 20 ]]; do
+            if domain=$(refresh_argo_domain_from_log); then
+                echo -e "${GREEN}Argo Quick Tunnel 域名: ${domain}${PLAIN}"
+                return 0
+            fi
+            if ! argo_service_is_active; then
+                echo -e "${YELLOW}cloudflared 未保持运行，准备重启...${PLAIN}"
+                break
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if [[ $rotation -lt $max_rotations ]]; then
+            echo -e "${YELLOW}Argo 域名获取超时，正在重启 cloudflared 重试 (${rotation}/${max_rotations})...${PLAIN}"
+            : > "$ARGO_LOG" 2>/dev/null || true
+            argo_service_restart >/dev/null 2>&1 || true
+            sleep 2
+        fi
+        rotation=$((rotation + 1))
+    done
+    echo -e "${RED}多次重试仍未获取 Argo 域名，请执行 'xr argo log' 查看日志。${PLAIN}"
+    return 1
+}
+
+# 轮询 named 隧道是否已向 Cloudflare 注册连接
+wait_for_named_ready() {
+    local waited=0
+    while [[ $waited -lt 20 ]]; do
+        if argo_recent_logs | grep -qE 'Registered tunnel connection|Connection [0-9a-fA-F-]+ registered'; then
             return 0
         fi
-        if ! argo_service_is_active; then
-            echo -e "${RED}cloudflared 未保持运行，请执行 'xr argo log' 查看日志。${PLAIN}"
-            return 1
-        fi
+        argo_service_is_active || return 1
         sleep 1
         waited=$((waited + 1))
     done
-    echo -e "${YELLOW}等待 Argo 域名超时，请稍后执行 'xr argo info' 或 'xr argo log' 查看。${PLAIN}"
     return 1
 }
 
 setup_argo_service() {
     argo_is_configured || return 1
 
-    local mode port edge_ip command_args
+    local mode port edge_ip command_args tunnel_name tunnel_uuid cred_file
     mode=$(argo_mode)
     port=$(argo_ws_port)
     edge_ip=$(argo_edge_ip)
@@ -361,15 +552,32 @@ setup_argo_service() {
     mkdir -p "$ARGO_DIR"
     touch "$ARGO_LOG" 2>/dev/null || true
 
-    if [[ "$mode" == "named" ]]; then
-        if [[ ! -s "$ARGO_TOKEN_FILE" ]]; then
-            echo -e "${RED}缺少 Argo Tunnel Token，请执行 'xr gen' 重新配置。${PLAIN}"
+    case "$mode" in
+        named)
+            if [[ ! -s "$ARGO_TOKEN_FILE" ]]; then
+                echo -e "${RED}缺少 Argo Tunnel Token，请执行 'xr gen' 重新配置。${PLAIN}"
+                return 1
+            fi
+            command_args="tunnel --no-autoupdate --edge-ip-version ${edge_ip} --protocol http2 --logfile ${ARGO_LOG} run --token-file ${ARGO_TOKEN_FILE}"
+            ;;
+        local)
+            tunnel_name=$(argo_tunnel_name)
+            tunnel_uuid=$(argo_tunnel_uuid)
+            cred_file=$(argo_credentials_file)
+            if [[ -z "$tunnel_name" || -z "$tunnel_uuid" || -z "$cred_file" || ! -s "$cred_file" || ! -f "$ARGO_CONFIG_YML" ]]; then
+                echo -e "${RED}缺少 local 模式隧道配置，请执行 'xr argo bind' 重新绑定。${PLAIN}"
+                return 1
+            fi
+            command_args="tunnel --no-autoupdate --edge-ip-version ${edge_ip} --protocol http2 --logfile ${ARGO_LOG} --config ${ARGO_CONFIG_YML} run ${tunnel_name}"
+            ;;
+        quick)
+            command_args="tunnel --no-autoupdate --edge-ip-version ${edge_ip} --protocol http2 --logfile ${ARGO_LOG} --url http://127.0.0.1:${port}"
+            ;;
+        *)
+            echo -e "${RED}未知 Argo 模式: ${mode}，请执行 'xr gen' 重新生成。${PLAIN}"
             return 1
-        fi
-        command_args="tunnel --no-autoupdate --edge-ip-version ${edge_ip} --protocol http2 --logfile ${ARGO_LOG} run --token-file ${ARGO_TOKEN_FILE}"
-    else
-        command_args="tunnel --no-autoupdate --edge-ip-version ${edge_ip} --protocol http2 --logfile ${ARGO_LOG} --url http://127.0.0.1:${port}"
-    fi
+            ;;
+    esac
 
     case "$INIT_SYSTEM" in
         systemd)
@@ -431,8 +639,14 @@ apply_argo_configuration() {
         download_cloudflared || return 1
         setup_argo_service || return 1
     else
+        local old_mode old_tunnel
+        old_mode=$(argo_mode)
+        old_tunnel=$(argo_tunnel_name)
         argo_service_remove
         clear_argo_state
+        if [[ "$old_mode" == "local" && -n "$old_tunnel" ]]; then
+            echo -e "${YELLOW}注意: 已取消 Argo 入站，但云端隧道 '${old_tunnel}' 与 DNS 记录未删除。${PLAIN}"
+        fi
     fi
 }
 
@@ -452,12 +666,20 @@ argo_start() {
     if [[ "$(argo_mode)" == "quick" ]]; then
         wait_for_argo_domain
     else
-        sleep 2
-        if ! argo_service_is_active; then
-            echo -e "${RED}Argo named 隧道未能保持运行，请检查 Token 和 'xr argo log'。${PLAIN}"
+        local mode
+        mode=$(argo_mode)
+        if wait_for_named_ready; then
+            echo -e "${GREEN}Argo ${mode} 隧道已启动: $(argo_domain)${PLAIN}"
+        elif argo_service_is_active; then
+            echo -e "${YELLOW}暂未在日志中确认 Argo ${mode} 隧道注册成功，请执行 'xr argo log' 检查。${PLAIN}"
+        else
+            if [[ "$mode" == "local" ]]; then
+                echo -e "${RED}Argo local 隧道未能保持运行，请检查 ${ARGO_CONFIG_YML} 与 'xr argo log'。${PLAIN}"
+            else
+                echo -e "${RED}Argo named 隧道未能保持运行，请检查 Token 和 'xr argo log'。${PLAIN}"
+            fi
             return 1
         fi
-        echo -e "${GREEN}Argo named 隧道已启动: $(argo_domain)${PLAIN}"
     fi
 }
 
@@ -492,6 +714,10 @@ argo_status() {
     domain=$(argo_domain)
 
     echo -e "模式:       ${CYAN}${mode:-未配置}${PLAIN}"
+    if [[ "$mode" == "local" ]]; then
+        echo -e "隧道名称:   ${CYAN}$(argo_tunnel_name)${PLAIN}"
+        echo -e "隧道 UUID:  ${CYAN}$(argo_tunnel_uuid)${PLAIN}"
+    fi
     if argo_service_is_active; then
         echo -e "服务状态:   ${GREEN}运行中${PLAIN}"
     else
@@ -512,7 +738,9 @@ argo_status() {
 view_argo_info() {
     argo_is_configured || return 1
 
-    local mode domain port path uuid
+    local mode domain port path uuid location_label="${1:-}" argo_node_name
+    [[ -z "$location_label" ]] && location_label=$(detect_location_label "$(argo_edge_ip)")
+    argo_node_name=$(node_name_with_location "Xray-VMess-Argo" "$location_label")
     mode=$(argo_mode)
     port=$(argo_ws_port)
     path=$(argo_ws_path)
@@ -527,8 +755,18 @@ view_argo_info() {
         return 1
     fi
 
+    local mode_label="${mode:-unknown}"
+    case "$mode" in
+        local) mode_label="local (cloudflared CLI 托管)" ;;
+        named) mode_label="named (Token)" ;;
+        quick) mode_label="quick (临时域名)" ;;
+    esac
+
     echo -e "${GREEN}【协议: VMess + WS (Cloudflare Argo)】${PLAIN}"
-    echo -e "  模式 (Mode):        ${CYAN}${mode:-unknown}${PLAIN}"
+    echo -e "  模式 (Mode):        ${CYAN}${mode_label}${PLAIN}"
+    if [[ "$mode" == "local" ]]; then
+        echo -e "  隧道名称 (Tunnel):  ${CYAN}$(argo_tunnel_name)${PLAIN}"
+    fi
     echo -e "  公网域名 (Host):    ${CYAN}${domain}${PLAIN}"
     echo -e "  本地监听 (Local):   ${CYAN}127.0.0.1:${port}${path}${PLAIN}"
     echo -e "  用户 ID (UUID):     ${CYAN}${uuid}${PLAIN}"
@@ -538,7 +776,7 @@ view_argo_info() {
 
     local argo_vmess_json argo_link
     argo_vmess_json=$(jq -cn \
-        --arg ps "Xray-VMess-Argo" \
+        --arg ps "$argo_node_name" \
         --arg add "$domain" \
         --argjson port 443 \
         --arg id "$uuid" \
@@ -554,7 +792,7 @@ view_argo_info() {
     echo -e "  ${YELLOW}${argo_link}${PLAIN}"
     echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
     jq -n \
-        --arg name "Xray-VMess-Argo" \
+        --arg name "$argo_node_name" \
         --arg server "$domain" \
         --argjson port 443 \
         --arg uuid "$uuid" \
@@ -601,11 +839,83 @@ argo_update() {
     argo_restart
 }
 
+# local 模式：创建/复用隧道并绑定固定域名
+argo_bind() {
+    if ! argo_is_configured; then
+        echo -e "${RED}未配置 Argo 隧道，请先执行 'xr gen' 并选择 Argo。${PLAIN}"
+        return 1
+    fi
+
+    local port mode domain name confirm
+    port=$(argo_ws_port)
+    if [[ -z "$port" || "$port" == "null" ]]; then
+        echo -e "${RED}未找到 Argo 本地 WS 端口，请执行 'xr gen' 重新生成。${PLAIN}"
+        return 1
+    fi
+
+    mode=$(argo_mode)
+    if [[ "$mode" != "local" ]]; then
+        echo -e "${YELLOW}当前模式为 ${mode:-未配置}，绑定固定域名后将切换为 local（cloudflared CLI 托管隧道）。${PLAIN}"
+        read -rp "确认继续？[y/N]: " confirm </dev/tty || confirm=""
+        [[ "$confirm" =~ ^[Yy]$ ]] || return 1
+    fi
+
+    download_cloudflared || return 1
+    ensure_argo_login || return 1
+
+    domain="${1:-}"
+    while true; do
+        if [[ -z "$domain" ]]; then
+            read -rp "输入要绑定的完整域名 (例如 argo.example.com): " domain </dev/tty || domain=""
+        fi
+        domain=$(printf '%s' "$domain" | tr -d '[:space:]')
+        domain=${domain%.}
+        domain=${domain,,}
+        if validate_domain "$domain"; then
+            break
+        fi
+        echo -e "${RED}域名格式无效，请重新输入。${PLAIN}"
+        domain=""
+    done
+
+    name=$(argo_tunnel_name)
+    if [[ -z "$name" || "$(argo_domain)" != "$domain" ]]; then
+        name=$(default_local_tunnel_name "$domain")
+    fi
+
+    ensure_local_tunnel "$name" || return 1
+    bind_local_dns "$name" "$domain" || return 1
+    write_local_argo_config "$BIND_TUNNEL_UUID" "$BIND_CRED_FILE" "$domain" "$port" || return 1
+
+    save_argo_state "local" "$domain" "" "$(argo_edge_ip)" \
+        "$name" "$BIND_TUNNEL_UUID" "$BIND_CRED_FILE" "$BIND_ORIGIN_CERT" || {
+        echo -e "${RED}Argo 状态写入失败。${PLAIN}"
+        return 1
+    }
+
+    setup_argo_service || return 1
+    argo_restart || return 1
+    refresh_links_quiet
+    echo -e "${GREEN}固定域名绑定完成: https://${domain} -> 127.0.0.1:${port}${PLAIN}"
+    view_argo_info
+}
+
 argo_uninstall() {
+    local mode tunnel_name
+    mode=$(argo_mode)
+    tunnel_name=$(argo_tunnel_name)
+
     argo_service_remove
     clear_argo_state
     rm -f "$ARGO_BIN"
     echo -e "${GREEN}Argo 隧道服务、配置和 cloudflared 已删除。${PLAIN}"
+
+    if [[ "$mode" == "local" && -n "$tunnel_name" ]]; then
+        echo -e "${YELLOW}云端隧道 '${tunnel_name}' 与对应 DNS 记录仍保留。如需彻底删除：${PLAIN}"
+        echo -e "  在 Cloudflare 面板删除，或重新安装 cloudflared 后执行:"
+        echo -e "  cloudflared tunnel delete ${tunnel_name}"
+        echo -e "${YELLOW}账号授权文件与隧道凭证仍保留在 ${HOME}/.cloudflared/，未删除。${PLAIN}"
+    fi
     echo -e "${YELLOW}如需同时移除本地 WS 入站，请执行 'xr gen' 并取消选择 Argo。${PLAIN}"
 }
 
@@ -621,9 +931,10 @@ ${GREEN}Argo 隧道管理${PLAIN}
  6. 查看实时日志 (log)
  7. 更新 cloudflared (update)
  8. 卸载 Argo (uninstall)
+ 9. 绑定固定域名 (bind, local 模式)
  0. 退出
 ------------------------"
-    read -rp "请输入选项 [0-8]: " argo_choice </dev/tty
+    read -rp "请输入选项 [0-9]: " argo_choice </dev/tty
     case "$argo_choice" in
         1) argo_status ;;
         2) view_argo_info ;;
@@ -633,6 +944,7 @@ ${GREEN}Argo 隧道管理${PLAIN}
         6) argo_logs ;;
         7) argo_update ;;
         8) argo_uninstall ;;
+        9) argo_bind ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效！${PLAIN}" ;;
     esac
@@ -648,6 +960,7 @@ argo_command() {
         log) argo_logs ;;
         update) argo_update ;;
         uninstall) argo_uninstall ;;
+        bind) shift; argo_bind "$@" ;;
         ""|menu) argo_menu ;;
         *)
             echo -e "${RED}未知 Argo 子命令: $1${PLAIN}"
@@ -888,15 +1201,97 @@ select_reality_target() {
     printf '%s\n' "$best_domain"
 }
 
-# 查看节点配置与分享链接
+# 随机高位端口，避免与其他部署或常用端口撞车
+random_free_port() {
+    local port attempt
+    for attempt in $(seq 1 50); do
+        port=$(( (RANDOM % 30000) + 20000 ))
+        if ! ss -H -ltn 2>/dev/null | awk -v p="$port" '$4 ~ (":" p "$") { found=1 } END { exit !found }'; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+    done
+    printf '%s\n' "$(( (RANDOM % 20000) + 40000 ))"
+}
+
+# 随机 WS 路径，避免所有部署共用同一路径指纹
+random_ws_path() {
+    local suffix
+    suffix=$(openssl rand -hex 6 2>/dev/null || head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    printf '/%s\n' "$suffix"
+}
+
+# 将 Cloudflare 元数据格式化为节点备注标签 (例如 US-LosAngeles-AS13335)
+location_label_from_meta() {
+    jq -r '
+        [ (.country // ""), (.city // ""),
+          (if (.asn // "") != "" then ("AS" + (.asn | tostring)) else "" end) ]
+        | map(select(length > 0)) | join("-")' 2>/dev/null |
+        tr -c 'A-Za-z0-9._-' '_' | sed 's/_*$//'
+}
+
+detect_location_label() {
+    local family="${1:-4}" ip_flag="--ipv4" meta=""
+    [[ "$family" == "6" ]] && ip_flag="--ipv6"
+    meta=$(curl -s "$ip_flag" --max-time 4 https://speed.cloudflare.com/meta 2>/dev/null || true)
+    [[ -z "$meta" ]] && return 0
+    location_label_from_meta <<<"$meta"
+}
+
+node_name_with_location() {
+    local base="$1" label="$2"
+    if [[ -n "$label" ]]; then
+        printf '%s-%s\n' "$base" "$label"
+    else
+        printf '%s\n' "$base"
+    fi
+}
+
+# 查看节点配置与分享链接（同时写入 links.txt）
 view_inbound_info() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         echo -e "${RED}未找到配置文件: ${CONFIG_FILE}${PLAIN}"
         return 1
     fi
 
-    local server_ip
-    server_ip=$(curl -s4m 6 https://api.ipify.org || curl -s4m 6 https://ip.sb || echo "YOUR_SERVER_IP")
+    local output status plain
+    output=$(render_inbound_info)
+    status=$?
+    printf '%s\n' "$output"
+
+    plain=$(printf '%s\n' "$output" | sed -E $'s/\x1b\\[[0-9;]*[mK]//g')
+    mkdir -p "$CONFIG_DIR" 2>/dev/null
+    if (umask 077; {
+        printf '# 节点信息（由 xr info 生成，%s）\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        printf '# 刷新并查看: xr info    仅查看已保存内容: xr links\n'
+        if argo_is_configured && [[ "$(argo_mode)" == "quick" ]]; then
+            printf '# 注意: Quick Tunnel 域名会随 cloudflared 重启变化，请重新执行 xr info。\n'
+        fi
+        printf '\n%s\n' "$plain"
+    } > "$LINKS_FILE"); then
+        chmod 600 "$LINKS_FILE" 2>/dev/null || true
+        echo -e "${YELLOW}节点信息已保存: ${LINKS_FILE}（权限 600）${PLAIN}"
+    else
+        echo -e "${YELLOW}警告: 无法写入 ${LINKS_FILE}${PLAIN}"
+    fi
+    return "$status"
+}
+
+# 渲染节点配置与分享链接（内部使用）
+render_inbound_info() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${RED}未找到配置文件: ${CONFIG_FILE}${PLAIN}"
+        return 1
+    fi
+
+    local server_ip location_label meta
+    meta=$(curl -s --ipv4 --max-time 4 https://speed.cloudflare.com/meta 2>/dev/null || true)
+    [[ -z "$meta" ]] && meta=$(curl -s --ipv6 --max-time 4 https://speed.cloudflare.com/meta 2>/dev/null || true)
+    server_ip=$(jq -r '.clientIp // empty' <<<"$meta" 2>/dev/null || true)
+    location_label=$(location_label_from_meta <<<"$meta")
+    if [[ -z "$server_ip" ]]; then
+        server_ip=$(curl -s4m 6 https://api.ipify.org || curl -s4m 6 https://ip.sb || echo "YOUR_SERVER_IP")
+    fi
 
     local ss_tag r_tag ws_tag argo_tag
     ss_tag=$(jq -r '.inbounds[] | select(.tag=="shadowsocks-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
@@ -917,12 +1312,16 @@ view_inbound_info() {
     echo -e "\n${CYAN}================================================================${PLAIN}"
     echo -e "${CYAN}                     当前 Xray 入站节点配置详情                 ${PLAIN}"
     echo -e "${CYAN}================================================================${PLAIN}"
+    if [[ -n "$location_label" ]]; then
+        echo -e "${CYAN}出口识别: ${location_label}${PLAIN}"
+    fi
 
     if [[ -n "$ss_tag" ]]; then
-        local ss_port ss_method ss_password
+        local ss_port ss_method ss_password ss_node_name
         ss_port=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .port' "$CONFIG_FILE")
         ss_method=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .settings.method' "$CONFIG_FILE")
         ss_password=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .settings.password' "$CONFIG_FILE")
+        ss_node_name=$(node_name_with_location "Xray-Shadowsocks" "$location_label")
 
         echo -e "${GREEN}【协议: Shadowsocks (SS2022)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${server_ip}${PLAIN}"
@@ -933,12 +1332,12 @@ view_inbound_info() {
         # SIP002: ss://base64url(method:password)@host:port#tag
         local ss_userinfo ss_link
         ss_userinfo=$(printf '%s' "${ss_method}:${ss_password}" | base64 | tr '+/' '-_' | tr -d '=\n')
-        ss_link="ss://${ss_userinfo}@${server_ip}:${ss_port}#Xray-Shadowsocks"
+        ss_link="ss://${ss_userinfo}@${server_ip}:${ss_port}#${ss_node_name}"
         echo -e "  分享链接 (Link):"
         echo -e "  ${YELLOW}${ss_link}${PLAIN}"
         echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
         jq -n \
-            --arg name "Xray-Shadowsocks" \
+            --arg name "$ss_node_name" \
             --arg server "$server_ip" \
             --argjson port "$ss_port" \
             --arg cipher "$ss_method" \
@@ -956,13 +1355,14 @@ view_inbound_info() {
     fi
 
     if [[ -n "$r_tag" ]]; then
-        local r_port r_uuid r_flow r_sni r_sid r_pri r_pub
+        local r_port r_uuid r_flow r_sni r_sid r_pri r_pub r_node_name
         r_port=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .port' "$CONFIG_FILE")
         r_uuid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .settings.clients[0].id' "$CONFIG_FILE")
         r_flow=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .settings.clients[0].flow' "$CONFIG_FILE")
         r_sni=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.serverNames[0]' "$CONFIG_FILE")
         r_pri=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.privateKey' "$CONFIG_FILE")
         r_sid=$(jq -r '.inbounds[] | select(.tag=="vless-reality-in") | .streamSettings.realitySettings.shortIds[0]' "$CONFIG_FILE")
+        r_node_name=$(node_name_with_location "Xray-Reality" "$location_label")
 
         # 优先从文件读取，若文件缺失则直接由私钥逆向推导公钥
         if [[ -s "${CONFIG_DIR}/reality_pub.key" ]]; then
@@ -984,12 +1384,12 @@ view_inbound_info() {
         echo -e "  Short ID:           ${CYAN}${r_sid}${PLAIN}"
 
         if [[ -n "$r_pub" ]]; then
-            local r_link="vless://${r_uuid}@${server_ip}:${r_port}?encryption=none&flow=${r_flow}&security=reality&sni=${r_sni}&fp=chrome&pbk=${r_pub}&sid=${r_sid}&type=tcp&headerType=none#Xray-Reality"
+            local r_link="vless://${r_uuid}@${server_ip}:${r_port}?encryption=none&flow=${r_flow}&security=reality&sni=${r_sni}&fp=chrome&pbk=${r_pub}&sid=${r_sid}&type=tcp&headerType=none#${r_node_name}"
             echo -e "  分享链接 (Link):"
             echo -e "  ${YELLOW}${r_link}${PLAIN}"
             echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
             jq -n \
-                --arg name "Xray-Reality" \
+                --arg name "$r_node_name" \
                 --arg server "$server_ip" \
                 --argjson port "$r_port" \
                 --arg uuid "$r_uuid" \
@@ -1021,12 +1421,13 @@ view_inbound_info() {
     fi
 
     if [[ -n "$ws_tag" ]]; then
-        local ws_port ws_uuid ws_sni ws_path ws_alpn
+        local ws_port ws_uuid ws_sni ws_path ws_alpn ws_node_name
         ws_port=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .port' "$CONFIG_FILE")
         ws_uuid=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .settings.clients[0].id' "$CONFIG_FILE")
         ws_sni=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.tlsSettings.serverName' "$CONFIG_FILE")
         ws_path=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | .streamSettings.wsSettings.path' "$CONFIG_FILE")
         ws_alpn=$(jq -r --arg t "$ws_tag" '.inbounds[] | select(.tag==$t) | (.streamSettings.tlsSettings.alpn[0] // "http/1.1")' "$CONFIG_FILE")
+        ws_node_name=$(node_name_with_location "Xray-VMess-WS-TLS" "$location_label")
 
         echo -e "${GREEN}【协议: VMess + WS + TLS (支持 CDN 回源)】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${ws_sni} (或填服务器IP/CDN优选IP)${PLAIN}"
@@ -1041,7 +1442,7 @@ view_inbound_info() {
         # vmess:// 分享链接 = base64(标准 vmess 节点 JSON)
         local ws_vmess_json ws_link
         ws_vmess_json=$(jq -cn \
-            --arg ps "Xray-VMess-WS-TLS" \
+            --arg ps "$ws_node_name" \
             --arg add "$ws_sni" \
             --argjson port "$ws_port" \
             --arg id "$ws_uuid" \
@@ -1057,7 +1458,7 @@ view_inbound_info() {
         echo -e "  ${YELLOW}${ws_link}${PLAIN}"
         echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
         jq -n \
-            --arg name "Xray-VMess-WS-TLS" \
+            --arg name "$ws_node_name" \
             --arg server "$ws_sni" \
             --argjson port "$ws_port" \
             --arg uuid "$ws_uuid" \
@@ -1090,7 +1491,7 @@ view_inbound_info() {
     fi
 
     if [[ -n "$argo_tag" ]]; then
-        view_argo_info
+        view_argo_info "$location_label"
     fi
 
     # 住宅 IP 出站
@@ -1144,7 +1545,7 @@ select_inbound_protocols() {
         echo -e "  ${GREEN}1)${PLAIN} Shadowsocks      ${YELLOW}默认端口 ${DEFAULT_SS_PORT}，加密 ${SS_METHOD}${PLAIN}"
         echo -e "  ${GREEN}2)${PLAIN} VLESS + Reality  ${YELLOW}默认端口 ${DEFAULT_REALITY_PORT}${PLAIN}"
         echo -e "  ${GREEN}3)${PLAIN} VMess + WS + TLS ${YELLOW}默认端口 ${DEFAULT_VMESS_WS_PORT}${PLAIN}"
-        echo -e "  ${GREEN}4)${PLAIN} Argo 隧道        ${YELLOW}本地明文 VMess-WS(默认 ${DEFAULT_ARGO_WS_PORT}) + 外部 cloudflared${PLAIN}"
+        echo -e "  ${GREEN}4)${PLAIN} Argo 隧道        ${YELLOW}本地明文 VMess-WS(默认随机高位端口) + 外部 cloudflared${PLAIN}"
         read -rp "请输入编号（多个用空格或逗号分隔，输入 all 全选）: " input </dev/tty || return 1
         input=$(printf '%s' "$input" | tr ',' ' ')
 
@@ -1221,7 +1622,7 @@ configure_inbound_ports() {
     SS_PORT="$DEFAULT_SS_PORT"
     REALITY_PORT="$DEFAULT_REALITY_PORT"
     VMESS_WS_PORT="$DEFAULT_VMESS_WS_PORT"
-    ARGO_WS_PORT="$DEFAULT_ARGO_WS_PORT"
+    ARGO_WS_PORT=$(random_free_port)
     SELECTED_PORTS=()
 
     if [[ $ENABLE_SS -eq 1 ]]; then
@@ -1237,6 +1638,9 @@ configure_inbound_ports() {
         SELECTED_PORTS+=("$VMESS_WS_PORT")
     fi
     if [[ $ENABLE_ARGO -eq 1 ]]; then
+        while port_in_selected "$ARGO_WS_PORT"; do
+            ARGO_WS_PORT=$(random_free_port)
+        done
         ARGO_WS_PORT=$(prompt_inbound_port "Argo 本地 WS (仅 127.0.0.1)" "$ARGO_WS_PORT")
         SELECTED_PORTS+=("$ARGO_WS_PORT")
     fi
@@ -1343,6 +1747,14 @@ generate_production_config() {
     configure_inbound_ports
     configure_residential_outbound
 
+    # 每次生成配置都使用随机 WS 路径，避免固定路径指纹
+    if [[ $ENABLE_VMESS -eq 1 ]]; then
+        VMESS_WS_PATH=$(random_ws_path)
+    fi
+    if [[ $ENABLE_ARGO -eq 1 ]]; then
+        ARGO_WS_PATH=$(random_ws_path)
+    fi
+
     local ws_domain=""
     if [[ $ENABLE_VMESS -eq 1 ]]; then
         ensure_dummy_cert || return 1
@@ -1359,12 +1771,17 @@ generate_production_config() {
     fi
 
     local argo_mode="" argo_public_domain="" argo_token="" argo_edge_ip="4"
+    local argo_local_tunnel_name="" argo_tunnel_uuid="" argo_cred_file="" argo_origin_cert=""
     if [[ $ENABLE_ARGO -eq 1 ]]; then
         echo -e "\n${CYAN}Argo 隧道配置${PLAIN}"
+        echo -e "  ${GREEN}1)${PLAIN} quick  随机域名（临时）"
+        echo -e "  ${GREEN}2)${PLAIN} named  固定域名，使用 Tunnel Token（需先在面板创建隧道）"
+        echo -e "  ${GREEN}3)${PLAIN} local  固定域名，cloudflared CLI 自动创建隧道并绑定 DNS（需浏览器授权）"
         local argo_mode_choice
-        read -rp "请选择 Argo 模式 [1) quick 随机域名  2) named 固定域名，默认 1]: " argo_mode_choice </dev/tty || argo_mode_choice=""
+        read -rp "请选择 Argo 模式 [1/2/3，默认 1]: " argo_mode_choice </dev/tty || argo_mode_choice=""
         case "$argo_mode_choice" in
             2|named|NAMED) argo_mode="named" ;;
+            3|local|LOCAL) argo_mode="local" ;;
             *) argo_mode="quick" ;;
         esac
 
@@ -1374,6 +1791,19 @@ generate_production_config() {
             argo_edge_ip="6"
         else
             argo_edge_ip="4"
+        fi
+
+        if [[ "$argo_mode" == "named" || "$argo_mode" == "local" ]]; then
+            while true; do
+                read -rp "请输入该 Tunnel 绑定的完整域名 (例如 argo.example.com): " argo_public_domain </dev/tty || argo_public_domain=""
+                argo_public_domain=$(printf '%s' "$argo_public_domain" | tr -d '[:space:]')
+                argo_public_domain=${argo_public_domain%.}
+                argo_public_domain=${argo_public_domain,,}
+                if validate_domain "$argo_public_domain"; then
+                    break
+                fi
+                echo -e "${RED}域名格式无效，请输入完整域名，例如 argo.example.com。${PLAIN}"
+            done
         fi
 
         if [[ "$argo_mode" == "named" ]]; then
@@ -1387,18 +1817,26 @@ generate_production_config() {
                 echo -e "${RED}Token 不能为空。${PLAIN}"
             done
 
-            while true; do
-                read -rp "请输入该 Tunnel 绑定的完整域名 (例如 argo.example.com): " argo_public_domain </dev/tty || argo_public_domain=""
-                argo_public_domain=$(printf '%s' "$argo_public_domain" | tr -d '[:space:]')
-                argo_public_domain=${argo_public_domain%.}
-                argo_public_domain=${argo_public_domain,,}
-                if validate_domain "$argo_public_domain"; then
-                    break
-                fi
-                echo -e "${RED}域名格式无效，请输入完整域名，例如 argo.example.com。${PLAIN}"
-            done
-
             echo -e "${YELLOW}请确保已在 Cloudflare Zero Trust 中将该域名指向 http://127.0.0.1:${ARGO_WS_PORT}${PLAIN}"
+        elif [[ "$argo_mode" == "local" ]]; then
+            echo -e "${YELLOW}local 模式将通过 cloudflared CLI 创建隧道并写入 DNS 记录。${PLAIN}"
+            download_cloudflared || return 1
+            ensure_argo_login || return 1
+            argo_origin_cert="$BIND_ORIGIN_CERT"
+
+            argo_local_tunnel_name=$(argo_tunnel_name)
+            if [[ -z "$argo_local_tunnel_name" || "$(argo_domain)" != "$argo_public_domain" ]]; then
+                argo_local_tunnel_name=$(default_local_tunnel_name "$argo_public_domain")
+            fi
+
+            ensure_local_tunnel "$argo_local_tunnel_name" || return 1
+            argo_tunnel_uuid="$BIND_TUNNEL_UUID"
+            argo_cred_file="$BIND_CRED_FILE"
+
+            bind_local_dns "$argo_local_tunnel_name" "$argo_public_domain" || return 1
+            write_local_argo_config "$argo_tunnel_uuid" "$argo_cred_file" \
+                "$argo_public_domain" "$ARGO_WS_PORT" || return 1
+            echo -e "${GREEN}隧道 ${argo_local_tunnel_name} 已绑定到 ${argo_public_domain}${PLAIN}"
         fi
 
         echo -e "${GREEN}Argo 模式: ${argo_mode}${PLAIN}"
@@ -1667,7 +2105,8 @@ generate_production_config() {
     fi
 
     if [[ $ENABLE_ARGO -eq 1 ]]; then
-        save_argo_state "$argo_mode" "$argo_public_domain" "$argo_token" "$argo_edge_ip" || {
+        save_argo_state "$argo_mode" "$argo_public_domain" "$argo_token" "$argo_edge_ip" \
+            "$argo_local_tunnel_name" "$argo_tunnel_uuid" "$argo_cred_file" "$argo_origin_cert" || {
             echo -e "${RED}Argo 状态写入失败。${PLAIN}"
             return 1
         }
@@ -1770,6 +2209,7 @@ start_service() {
         echo -e "${GREEN}Xray 服务已启动。${PLAIN}"
         if argo_is_configured; then
             argo_start || echo -e "${YELLOW}Argo 隧道启动异常，请执行 'xr argo log' 排查。${PLAIN}"
+            refresh_links_quiet
         fi
         check_status
     else
@@ -1792,6 +2232,7 @@ restart_service() {
         echo -e "${GREEN}Xray 服务已重启。${PLAIN}"
         if argo_is_configured; then
             argo_restart || echo -e "${YELLOW}Argo 隧道重启异常，请执行 'xr argo log' 排查。${PLAIN}"
+            refresh_links_quiet
         fi
         check_status
     else
@@ -1873,6 +2314,10 @@ uninstall_all() {
     read -rp "确定要完全卸载 Xray 吗？[y/N]: " confirm </dev/tty
     [[ ! "$confirm" =~ ^[Yy]$ ]] && exit 0
 
+    local argo_mode_before argo_tunnel_before
+    argo_mode_before=$(argo_mode)
+    argo_tunnel_before=$(argo_tunnel_name)
+
     service_remove
     argo_service_remove
 
@@ -1892,6 +2337,10 @@ uninstall_all() {
     fi
 
     echo -e "${GREEN}Xray 及快捷管理命令已完全卸载。${PLAIN}"
+    if [[ "$argo_mode_before" == "local" && -n "$argo_tunnel_before" ]]; then
+        echo -e "${YELLOW}注意: 云端 Argo 隧道 '${argo_tunnel_before}' 与 DNS 记录仍保留。${PLAIN}"
+        echo -e "${YELLOW}如需删除，请在 Cloudflare 面板操作，或重新安装 cloudflared 后执行 tunnel delete。${PLAIN}"
+    fi
     exit 0
 }
 
@@ -1907,6 +2356,24 @@ install_cli() {
     fi
     chmod 0755 "$CLI_TARGET"
     echo -e "${GREEN}快捷管理命令 'xr' 部署完成。${PLAIN}"
+}
+
+# 查看已保存的节点链接（不重新探测网络）
+view_saved_links() {
+    if [[ ! -s "$LINKS_FILE" ]]; then
+        echo -e "${YELLOW}尚未生成链接文件，请先执行 'xr info'。${PLAIN}"
+        return 1
+    fi
+    if argo_is_configured && [[ "$(argo_mode)" == "quick" ]]; then
+        echo -e "${YELLOW}提示: quick 模式域名可能已变化，建议执行 'xr info' 重新生成。${PLAIN}"
+    fi
+    cat "$LINKS_FILE"
+}
+
+# 静默刷新 links.txt（例如 Argo quick 域名生成之后）
+refresh_links_quiet() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    view_inbound_info >/dev/null 2>&1 || true
 }
 
 # 交互菜单
@@ -1926,9 +2393,10 @@ ${GREEN}Xray (${XRAY_VERSION}) 服务管理工具 (xr)${PLAIN}
 10. BBR 状态与网络调优 (bbr)
 11. Argo 隧道管理 (argo)
 12. 卸载 Xray (uninstall)
+13. 查看已保存节点链接 (links)
  0. 退出
 ------------------------"
-    read -rp "请输入选项 [0-12]: " choice </dev/tty
+    read -rp "请输入选项 [0-13]: " choice </dev/tty
     case "$choice" in
         1) start_service ;;
         2) stop_service ;;
@@ -1942,6 +2410,7 @@ ${GREEN}Xray (${XRAY_VERSION}) 服务管理工具 (xr)${PLAIN}
         10) manage_bbr ;;
         11) argo_menu ;;
         12) uninstall_all ;;
+        13) view_saved_links ;;
         0) exit 0 ;;
         *) echo -e "${RED}输入无效！${PLAIN}" ;;
     esac
@@ -1956,6 +2425,7 @@ main() {
         status) check_status ;;
         log) view_logs ;;
         info) view_inbound_info ;;
+        links) view_saved_links ;;
         check|test) test_config ;;
         edit) edit_config ;;
         gen) generate_production_config && apply_argo_configuration ;;
@@ -1991,6 +2461,7 @@ main() {
                 echo -e " 配置文件: ${CONFIG_FILE}"
                 echo -e " 证书目录: ${CERT_DIR}/"
                 echo -e " 查看节点信息: ${YELLOW}xr info${PLAIN}"
+                echo -e " 已保存链接:   ${YELLOW}${LINKS_FILE}${PLAIN} (${YELLOW}xr links${PLAIN})"
                 echo -e " Argo 管理:    ${YELLOW}xr argo${PLAIN}"
                 echo -e " 全局管理工具: ${YELLOW}xr${PLAIN}"
                 echo -e "${GREEN}=================================================${PLAIN}"
