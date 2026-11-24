@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =========================================================
 # sing-box 一键安装、服务管理、BBR 调优、配置生成与节点查看脚本
-# 入站: 可选 Shadowsocks(默认32443) / VLESS-Reality(默认443) / VMess-WS-TLS(默认2053) / Hysteria2(默认8443 UDP) / Argo 隧道
+# 入站: 可选 SOCKS5(默认32443) / VLESS-Reality(默认443) / VMess-WS-TLS(默认2053) / Hysteria2(默认8443 UDP) / Argo 隧道
 # 支持 systemd (Debian/Ubuntu/CentOS 等) 与 OpenRC (Alpine 等)
 # =========================================================
 
@@ -39,14 +39,15 @@ LIMITS_FILE="/etc/security/limits.d/99-nofile.conf"
 LOCAL_D_FILE="/etc/local.d/99-network-bbr.start"
 
 # 入站协议候选参数
-SS_PORT=32443
-SS_METHOD="2022-blake3-aes-128-gcm"
+SOCKS_PORT=32443
+SOCKS_USER="askls123"
+SOCKS_PASS='!QAZ4rfv'
 REALITY_PORT=443
 VMESS_WS_PORT=2053
 HY2_PORT=8443
 VMESS_WS_PATH="/175443"
 # 默认端口（用户可在生成配置时自定义）
-DEFAULT_SS_PORT="$SS_PORT"
+DEFAULT_SOCKS_PORT="$SOCKS_PORT"
 DEFAULT_REALITY_PORT="$REALITY_PORT"
 DEFAULT_VMESS_WS_PORT="$VMESS_WS_PORT"
 DEFAULT_HY2_PORT="$HY2_PORT"
@@ -1074,9 +1075,9 @@ render_inbound_info() {
     local ws_tag
     ws_tag=$(jq -r '.inbounds[] | select(.tag=="vmess-ws-tls-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
 
-    # 解析 Shadowsocks 入站
-    local ss_tag
-    ss_tag=$(jq -r '.inbounds[] | select(.tag=="shadowsocks-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
+    # 解析 SOCKS5 入站
+    local socks_tag
+    socks_tag=$(jq -r '.inbounds[] | select(.tag=="socks-in") | .tag' "$CONFIG_FILE" 2>/dev/null)
 
     # 解析 Hysteria2 入站
     local hy2_tag
@@ -1090,8 +1091,12 @@ render_inbound_info() {
         echo -e "${YELLOW}提示: 检测到旧版 VLESS-WS-TLS 入站，当前版本已改为 VMess-WS-TLS。${PLAIN}"
         echo -e "${YELLOW}      执行 'sb gen' 可重新选择并生成入站配置。${PLAIN}"
     fi
+    if jq -e 'any(.inbounds[]?; .tag == "shadowsocks-in")' "$CONFIG_FILE" >/dev/null 2>&1; then
+        echo -e "${YELLOW}提示: 检测到旧版 Shadowsocks 入站，当前版本已改为 SOCKS5。${PLAIN}"
+        echo -e "${YELLOW}      执行 'sb gen' 可重新选择并生成入站配置。${PLAIN}"
+    fi
 
-    if [[ -z "$ss_tag" && -z "$r_tag" && -z "$ws_tag" && -z "$hy2_tag" && -z "$argo_tag" ]]; then
+    if [[ -z "$socks_tag" && -z "$r_tag" && -z "$ws_tag" && -z "$hy2_tag" && -z "$argo_tag" ]]; then
         echo -e "${RED}未找到可识别的入站配置，请执行 'sb gen' 重新生成。${PLAIN}"
         return 1
     fi
@@ -1103,40 +1108,39 @@ render_inbound_info() {
         echo -e "${CYAN}出口识别: ${location_label}${PLAIN}"
     fi
 
-    if [[ -n "$ss_tag" ]]; then
-        local ss_port ss_method ss_password ss_node_name
-        ss_port=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .listen_port' "$CONFIG_FILE")
-        ss_method=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .method' "$CONFIG_FILE")
-        ss_password=$(jq -r --arg t "$ss_tag" '.inbounds[] | select(.tag==$t) | .password' "$CONFIG_FILE")
-        ss_node_name=$(node_name_with_location "sing-box-Shadowsocks" "$location_label")
+    if [[ -n "$socks_tag" ]]; then
+        local socks_port socks_user socks_pass socks_node_name socks_user_enc socks_pass_enc socks_link
+        socks_port=$(jq -r --arg t "$socks_tag" '.inbounds[] | select(.tag==$t) | .listen_port' "$CONFIG_FILE")
+        socks_user=$(jq -r --arg t "$socks_tag" '.inbounds[] | select(.tag==$t) | .users[0].username // empty' "$CONFIG_FILE")
+        socks_pass=$(jq -r --arg t "$socks_tag" '.inbounds[] | select(.tag==$t) | .users[0].password // empty' "$CONFIG_FILE")
+        socks_node_name=$(node_name_with_location "sing-box-SOCKS5" "$location_label")
 
-        echo -e "${GREEN}【协议: Shadowsocks (SS2022)】${PLAIN}"
+        echo -e "${GREEN}【协议: SOCKS5】${PLAIN}"
         echo -e "  地址 (Address):     ${CYAN}${server_ip}${PLAIN}"
-        echo -e "  端口 (Port):        ${CYAN}${ss_port}${PLAIN}"
-        echo -e "  加密方式 (Method):  ${CYAN}${ss_method}${PLAIN}"
-        echo -e "  密码 (Password):    ${CYAN}${ss_password}${PLAIN}"
+        echo -e "  端口 (Port):        ${CYAN}${socks_port}${PLAIN}"
+        echo -e "  用户名 (Username):  ${CYAN}${socks_user}${PLAIN}"
+        echo -e "  密码 (Password):    ${CYAN}${socks_pass}${PLAIN}"
 
-        # SIP002: ss://base64url(method:password)@host:port#tag
-        local ss_userinfo ss_link
-        ss_userinfo=$(printf '%s' "${ss_method}:${ss_password}" | base64 | tr '+/' '-_' | tr -d '=\n')
-        ss_link="ss://${ss_userinfo}@${server_ip}:${ss_port}#${ss_node_name}"
+        socks_user_enc=$(printf '%s' "$socks_user" | jq -sRr @uri)
+        socks_pass_enc=$(printf '%s' "$socks_pass" | jq -sRr @uri)
+        socks_link="socks5://${socks_user_enc}:${socks_pass_enc}@${server_ip}:${socks_port}#${socks_node_name}"
         echo -e "  分享链接 (Link):"
-        echo -e "  ${YELLOW}${ss_link}${PLAIN}"
+        echo -e "  ${YELLOW}${socks_link}${PLAIN}"
         echo -e "  Mihomo 节点 JSON (添加到 proxies 数组):"
         jq -n \
-            --arg name "$ss_node_name" \
+            --arg name "$socks_node_name" \
             --arg server "$server_ip" \
-            --argjson port "$ss_port" \
-            --arg cipher "$ss_method" \
-            --arg password "$ss_password" \
+            --argjson port "$socks_port" \
+            --arg username "$socks_user" \
+            --arg password "$socks_pass" \
             '{
               name: $name,
-              type: "ss",
+              type: "socks5",
               server: $server,
               port: $port,
-              udp: true,
-              cipher: $cipher,
-              password: $password
+              username: $username,
+              password: $password,
+              udp: true
             }'
         echo -e "----------------------------------------------------------------"
     fi
@@ -1348,7 +1352,7 @@ render_inbound_info() {
 
 # 交互选择需要启用的入站协议（至少一个）
 select_inbound_protocols() {
-    ENABLE_SS=0
+    ENABLE_SOCKS=0
     ENABLE_REALITY=0
     ENABLE_VMESS=0
     ENABLE_HY2=0
@@ -1358,7 +1362,7 @@ select_inbound_protocols() {
     local input token
     while true; do
         echo -e "\n${CYAN}请选择要启用的入站协议（可多选，至少选择一个）：${PLAIN}"
-        echo -e "  ${GREEN}1)${PLAIN} Shadowsocks      ${YELLOW}默认端口 ${DEFAULT_SS_PORT}，加密 ${SS_METHOD}${PLAIN}"
+        echo -e "  ${GREEN}1)${PLAIN} SOCKS5           ${YELLOW}默认端口 ${DEFAULT_SOCKS_PORT}，用户 ${SOCKS_USER}${PLAIN}"
         echo -e "  ${GREEN}2)${PLAIN} VLESS + Reality  ${YELLOW}默认端口 ${DEFAULT_REALITY_PORT}${PLAIN}"
         echo -e "  ${GREEN}3)${PLAIN} VMess + WS + TLS ${YELLOW}默认端口 ${DEFAULT_VMESS_WS_PORT}${PLAIN}"
         echo -e "  ${GREEN}4)${PLAIN} Hysteria2        ${YELLOW}默认端口 ${DEFAULT_HY2_PORT} (UDP)，QUIC${PLAIN}"
@@ -1366,25 +1370,25 @@ select_inbound_protocols() {
         read -rp "请输入编号（多个用空格或逗号分隔，输入 all 全选）: " input </dev/tty || return 1
         input=$(printf '%s' "$input" | tr ',' ' ')
 
-        local ss=0 reality=0 vmess=0 hy2=0 argo=0 invalid=0
+        local socks=0 reality=0 vmess=0 hy2=0 argo=0 invalid=0
         for token in $input; do
             case "$token" in
-                1) ss=1 ;;
+                1) socks=1 ;;
                 2) reality=1 ;;
                 3) vmess=1 ;;
                 4) hy2=1 ;;
                 5) argo=1 ;;
-                all|ALL|All) ss=1; reality=1; vmess=1; hy2=1; argo=1 ;;
+                all|ALL|All) socks=1; reality=1; vmess=1; hy2=1; argo=1 ;;
                 *) invalid=1 ;;
             esac
         done
 
-        if [[ $invalid -eq 1 || $((ss + reality + vmess + hy2 + argo)) -eq 0 ]]; then
+        if [[ $invalid -eq 1 || $((socks + reality + vmess + hy2 + argo)) -eq 0 ]]; then
             echo -e "${RED}输入无效，请输入 1、2、3、4、5 的组合（如 1,3），或输入 all。${PLAIN}"
             continue
         fi
 
-        ENABLE_SS=$ss
+        ENABLE_SOCKS=$socks
         ENABLE_REALITY=$reality
         ENABLE_VMESS=$vmess
         ENABLE_HY2=$hy2
@@ -1393,7 +1397,7 @@ select_inbound_protocols() {
     done
 
     echo -e "${GREEN}已选择入站协议：${PLAIN}"
-    [[ $ENABLE_SS -eq 1 ]] && echo -e "  - Shadowsocks"
+    [[ $ENABLE_SOCKS -eq 1 ]] && echo -e "  - SOCKS5"
     [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality"
     [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS"
     [[ $ENABLE_HY2 -eq 1 ]] && echo -e "  - Hysteria2"
@@ -1439,16 +1443,16 @@ prompt_inbound_port() {
 
 # 逐个配置已选协议的入站端口
 configure_inbound_ports() {
-    SS_PORT="$DEFAULT_SS_PORT"
+    SOCKS_PORT="$DEFAULT_SOCKS_PORT"
     REALITY_PORT="$DEFAULT_REALITY_PORT"
     VMESS_WS_PORT="$DEFAULT_VMESS_WS_PORT"
     HY2_PORT="$DEFAULT_HY2_PORT"
     ARGO_WS_PORT=$(random_free_port)
     SELECTED_PORTS=()
 
-    if [[ $ENABLE_SS -eq 1 ]]; then
-        SS_PORT=$(prompt_inbound_port "Shadowsocks" "$SS_PORT")
-        SELECTED_PORTS+=("$SS_PORT")
+    if [[ $ENABLE_SOCKS -eq 1 ]]; then
+        SOCKS_PORT=$(prompt_inbound_port "SOCKS5" "$SOCKS_PORT")
+        SELECTED_PORTS+=("$SOCKS_PORT")
     fi
     if [[ $ENABLE_REALITY -eq 1 ]]; then
         REALITY_PORT=$(prompt_inbound_port "VLESS + Reality" "$REALITY_PORT")
@@ -1471,7 +1475,7 @@ configure_inbound_ports() {
     fi
 
     echo -e "${GREEN}入站端口：${PLAIN}"
-    [[ $ENABLE_SS -eq 1 ]] && echo -e "  - Shadowsocks: ${SS_PORT}"
+    [[ $ENABLE_SOCKS -eq 1 ]] && echo -e "  - SOCKS5: ${SOCKS_PORT}"
     [[ $ENABLE_REALITY -eq 1 ]] && echo -e "  - VLESS + Reality: ${REALITY_PORT}"
     [[ $ENABLE_VMESS -eq 1 ]] && echo -e "  - VMess + WS + TLS: ${VMESS_WS_PORT}"
     [[ $ENABLE_HY2 -eq 1 ]] && echo -e "  - Hysteria2: ${HY2_PORT} (UDP)"
@@ -1743,12 +1747,6 @@ generate_production_config() {
         short_id=$(openssl rand -hex 8 2>/dev/null || ${INSTALL_DIR}/sing-box generate rand --hex 8)
     fi
 
-    local ss_password=""
-    if [[ $ENABLE_SS -eq 1 ]]; then
-        # 2022-blake3-aes-128-gcm 需要 16 字节密钥（base64 编码）
-        ss_password=$(openssl rand -base64 16 | tr -d '\n')
-    fi
-
     local hy2_password=""
     if [[ $ENABLE_HY2 -eq 1 ]]; then
         # 使用十六进制，避免 URI 中出现需要转义的字符
@@ -1757,18 +1755,22 @@ generate_production_config() {
 
     local inbounds='[]'
 
-    if [[ $ENABLE_SS -eq 1 ]]; then
+    if [[ $ENABLE_SOCKS -eq 1 ]]; then
         inbounds=$(jq -c \
-            --argjson port "$SS_PORT" \
-            --arg method "$SS_METHOD" \
-            --arg password "$ss_password" \
+            --argjson port "$SOCKS_PORT" \
+            --arg username "$SOCKS_USER" \
+            --arg password "$SOCKS_PASS" \
             '. + [{
-              "type": "shadowsocks",
-              "tag": "shadowsocks-in",
+              "type": "socks",
+              "tag": "socks-in",
               "listen": "::",
               "listen_port": $port,
-              "method": $method,
-              "password": $password
+              "users": [
+                {
+                  "username": $username,
+                  "password": $password
+                }
+              ]
             }]' <<<"$inbounds") || return 1
     fi
 
@@ -2098,7 +2100,7 @@ show_start_failure() {
     service_logs_recent
     local port_regex
     port_regex=$(jq -r '[.inbounds[]? | (.port // .listen_port)] | map(tostring) | join("|")' "$CONFIG_FILE" 2>/dev/null)
-    [[ -z "$port_regex" || "$port_regex" == "null" ]] && port_regex="${DEFAULT_SS_PORT}|${DEFAULT_REALITY_PORT}|${DEFAULT_VMESS_WS_PORT}|${DEFAULT_HY2_PORT}|${DEFAULT_ARGO_WS_PORT}"
+    [[ -z "$port_regex" || "$port_regex" == "null" ]] && port_regex="${DEFAULT_SOCKS_PORT}|${DEFAULT_REALITY_PORT}|${DEFAULT_VMESS_WS_PORT}|${DEFAULT_HY2_PORT}|${DEFAULT_ARGO_WS_PORT}"
     echo -e "${YELLOW}可依次执行：sb test、ss -lntup | grep -E ':(${port_regex})'、sb log 进行排查。${PLAIN}"
 }
 
@@ -2399,10 +2401,9 @@ main() {
                 download_singbox
                 generate_production_config || exit 1
 
-                # 仅检查用户实际选择的入站端口（Shadowsocks 同时使用 TCP/UDP，Hysteria2 使用 UDP）
-                if [[ $ENABLE_SS -eq 1 ]]; then
-                    check_port_available "$SS_PORT" tcp || exit 1
-                    check_port_available "$SS_PORT" udp || exit 1
+                # 仅检查用户实际选择的入站端口（SOCKS5 使用 TCP，Hysteria2 使用 UDP）
+                if [[ $ENABLE_SOCKS -eq 1 ]]; then
+                    check_port_available "$SOCKS_PORT" tcp || exit 1
                 fi
                 if [[ $ENABLE_REALITY -eq 1 ]]; then
                     check_port_available "$REALITY_PORT" tcp || exit 1
