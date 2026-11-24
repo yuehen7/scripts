@@ -1,12 +1,13 @@
 # scripts
 
-代理服务一键安装与管理脚本，包含 Xray、sing-box 与 WireProxy-WARP 三套独立实现。
+代理服务与端口转发一键安装管理脚本，包含 Xray、sing-box、WireProxy-WARP 与 Realm 四套独立实现。
 
 | 脚本 | 内核版本 | 管理命令 | 配置文件 |
 | --- | --- | --- | --- |
 | `install_xray.sh` | Xray `v26.6.27`（固定版本） | `xr` | `/etc/xray/config.json` |
 | `install_singbox.sh` | sing-box（安装时获取最新版） | `sb` | `/etc/sing-box/config.json` |
 | `install_warp.sh` | WireProxy + wgcf（安装时获取最新版） | `warp` | `/etc/wireproxy/wireproxy.conf` |
+| `install_realm.sh` | Realm（安装时获取最新版） | `realm` | `/etc/realm/config.toml` |
 
 ## 环境要求
 
@@ -18,6 +19,8 @@
 - Argo quick 模式会额外下载 `cloudflared`（支持 Linux amd64 / arm64 / armv7 / i386）；sing-box named 模式使用 1.14+ 内置 cloudflared，不需要额外二进制
 
 > WireProxy-WARP 由 wgcf 注册账户，wgcf 官方仅提供 x86_64、arm64、armv7、386、s390x 二进制，暂不支持 riscv64。WARP 使用 UDP 出站，服务器需能访问 CloudFlare 的 WARP Endpoint（默认 2408 端口）。
+
+> Realm 官方预编译包支持 x86_64、aarch64、armv7、armv6、mips/mipsel/mips64/mips64el，暂不支持 s390x、riscv64 与 32 位 x86。脚本会根据架构与 libc（glibc / musl）自动选择对应安装包。
 
 ## 安装
 
@@ -43,6 +46,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install
 
 WireProxy-WARP 安装流程：安装依赖 → 下载 WireProxy 与 wgcf → 设置 SOCKS5 端口和监听地址 → 注册 WARP 账户 → 生成配置 → 注册服务（systemd/OpenRC）→ 启动并验证连通性。
 
+### Realm 端口转发
+
+```shell
+bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_realm.sh)
+```
+
+Realm 安装流程：安装依赖 → 应用 BBR/网络优化 → 下载 Realm 内核 → 生成基础配置 → 注册服务（systemd/OpenRC）→ 交互添加第一条转发规则 → 启动。已安装时会询问是否保留现有规则，仅更新内核。
+
 ### Alpine Linux
 
 Alpine 默认使用 OpenRC，且未预装 bash，请先安装 bash 再执行脚本：
@@ -52,12 +63,12 @@ apk add --no-cache bash curl ca-certificates
 bash <(curl -fsSL https://raw.githubusercontent.com/yuehen7/scripts/main/install_xray.sh)
 ```
 
-sing-box / WARP 同理，把文件名换成 `install_singbox.sh` / `install_warp.sh` 即可。
+sing-box / WARP / Realm 同理，把文件名换成 `install_singbox.sh` / `install_warp.sh` / `install_realm.sh` 即可。
 
 脚本会自动识别服务管理器：
 
-- systemd：注册 `/etc/systemd/system/xray.service`、`sing-box.service` 或 `wireproxy-warp.service`，日志通过 `journalctl` 查看
-- OpenRC：生成 `/etc/init.d/xray`、`/etc/init.d/sing-box` 或 `/etc/init.d/wireproxy-warp`，日志写入 `/var/log/xray.log`、`/var/log/sing-box.log` 或 `/var/log/wireproxy-warp.log`
+- systemd：注册 `/etc/systemd/system/xray.service`、`sing-box.service`、`wireproxy-warp.service` 或 `realm.service`，日志通过 `journalctl` 查看
+- OpenRC：生成 `/etc/init.d/xray`、`/etc/init.d/sing-box`、`/etc/init.d/wireproxy-warp` 或 `/etc/init.d/realm`，日志写入 `/var/log/xray.log`、`/var/log/sing-box.log`、`/var/log/wireproxy-warp.log` 或 `/var/log/realm.log`
 
 ## 入站协议选择
 
@@ -282,6 +293,53 @@ warp stack auto   # 恢复自动
 
 优先级会写入 `/etc/wireproxy/wireproxy.conf` 的 `[Resolve] ResolveStrategy`，切换后自动重启并验证；`warp info` 会显示当前策略。
 
+## Realm 端口转发
+
+[Realm](https://github.com/zhboner/realm) 是一个用 Rust 编写的高性能端口转发工具，适合把中转机的端口转发到落地机，常用于中转 Hysteria2、Reality、游戏加速等 TCP/UDP 流量。
+
+核心特性：
+
+- 默认同时转发 TCP + UDP，UDP 可用于 Hysteria2、游戏等场景
+- 支持单条规则只开 TCP 或只开 UDP
+- 支持 `through` 指定出口 IP、`interface` 指定出口网卡
+- 支持 `extra_remotes` + `balance` 在多个落地之间做负载均衡（`roundrobin` / `iphash`）
+- 规则增删改后自动重启服务，配置权限 `600`，每次保存前自动备份为 `config.toml.bak`
+
+### 规则管理
+
+安装后无参数运行 `realm` 进入交互菜单，也可以直接使用子命令：
+
+```shell
+realm list                          # 查看所有转发规则
+realm add                           # 交互添加规则
+realm add 6666 1.2.3.4 443         # 监听 6666 -> 1.2.3.4:443（TCP+UDP）
+realm add 8443 "[2001:db8::1]" 443 hy2-relay udp
+                                     # 监听 8443 -> [2001:db8::1]:443，仅 UDP，带名称
+realm edit 1                        # 修改规则 1（直接回车保留当前值）
+realm del 2                         # 删除规则 2
+realm check                         # 检查配置结构
+```
+
+交互添加规则时会依次询问：
+
+1. 规则名称（可选，仅用于展示）
+2. 本机监听地址和端口（监听地址默认 `0.0.0.0`；若端口被占用会拒绝）
+3. 落地地址和端口（IPv6 使用 `[2001:db8::1]` 形式）
+4. 转发模式：TCP+UDP / 仅 TCP / 仅 UDP
+5. 是否配置高级选项：`through`、`interface`、`extra_remotes`、`balance`
+
+> Realm 本身没有 `--test` / `-t` 配置检查参数，`realm check` 只做配置结构、端口重复和地址格式检查。修改后若服务未能启动，请执行 `realm log` 查看 Realm 的真实报错。
+
+### 配置与限制
+
+- 配置文件：`/etc/realm/config.toml`，由脚本按 `[[endpoints]]` 分块管理
+- 内核：`/usr/local/bin/realm-bin`，管理命令：`/usr/local/bin/realm`
+- 修改规则建议使用 `realm edit` / `realm del`；手动编辑配置后执行 `realm restart`
+- 转发是否可用还取决于**落地机防火墙/安全组是否允许中转机 IP 访问落地端口**
+- Realm 只做端口转发，不提供加密或伪装；需要 TLS / Reality / Hysteria2 时，落地机仍需运行对应服务
+- 使用 `balance` 时，Realm 官方预编译包已内置 `balance` 特性；如果自行替换为 slim 版本则不可用
+- 监听端口需在本机和云安全组放行；可执行 `realm fw <端口>` 自动放行 ufw / firewalld 的 TCP+UDP 端口
+
 ## 服务管理
 
 安装完成后会部署管理命令，无参数运行进入交互菜单：
@@ -290,6 +348,7 @@ warp stack auto   # 恢复自动
 xr          # Xray 交互菜单
 sb          # sing-box 交互菜单
 warp        # WireProxy-WARP 交互菜单
+realm       # Realm 交互菜单
 ```
 
 | 子命令 | Xray | sing-box | 说明 |
@@ -320,6 +379,24 @@ warp ip
 ```
 
 WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`status`、`log`、`info`、`check`、`test`、`edit`、`uninstall`，以及专用的 `ip`、`endpoint`、`port`、`stack`、`reg`、`plus` 子命令。
+
+Realm 的 `realm` 支持：
+
+| 子命令 | 说明 |
+| --- | --- |
+| `start` / `stop` / `restart` | 服务控制 |
+| `status` | 查看内核版本、运行状态与规则数量 |
+| `log` | 实时查看日志（systemd 用 `journalctl -u realm`） |
+| `list` | 查看转发规则 |
+| `add` | 交互或非交互添加规则 |
+| `edit [ID]` | 修改规则 |
+| `del [ID]` | 删除规则 |
+| `check` | 检查配置结构 |
+| `config` | 编辑配置文件并做结构检查 |
+| `update` | 更新 Realm 内核到最新版（保留规则） |
+| `bbr` | 查看/重新应用 BBR 优化 |
+| `fw <端口>` | 用 ufw / firewalld 放行 TCP+UDP 端口 |
+| `uninstall` | 卸载 Realm 与快捷命令 |
 
 > `xr gen` / `sb gen` 会覆盖现有 `config.json`，并重新生成 Shadowsocks 密码、Reality 密钥和 Short ID，执行后需同步更新客户端节点。
 
@@ -366,14 +443,17 @@ WireProxy-WARP 的 `warp` 支持上表中的 `start`、`stop`、`restart`、`sta
 | Hysteria2 | 8443 | UDP |
 | Argo 本地 VMess-WS | 安装时随机（可自定义） | TCP（仅 `127.0.0.1`） |
 | WireProxy SOCKS5 | 安装时随机 / 自定义 | TCP |
+| Realm 转发规则 | 添加规则时自定义 | TCP + UDP（可只开其中一种） |
 
-云服务器还需在安全组中放行相同端口。如果生成配置时自定义了端口，请以实际配置为准；`xr info` / `sb info` / `warp info` 会显示最终使用的端口。
+云服务器还需在安全组中放行相同端口。如果生成配置时自定义了端口，请以实际配置为准；`xr info` / `sb info` / `warp info` / `realm list` 会显示最终使用的端口。
 
 Hysteria2 是 UDP/QUIC 协议，除本机防火墙外，云安全组也必须放行对应的 **UDP** 端口。
 
 Argo 本地 VMess-WS 仅监听 `127.0.0.1`，无需放行；对外流量由 cloudflared 主动出站连接 Cloudflare 边缘。生成配置时默认分配随机高位端口并生成随机 WS 路径，实际值可从 `xr info` / `sb info` 或配置文件中查看。
 
 WireProxy 仅监听 `127.0.0.1` 时无需放行端口；监听 `0.0.0.0` 时需放行对应 TCP 端口，并建议启用 SOCKS5 用户名/密码认证、限制来源 IP。WARP 本身通过 UDP 连接 CloudFlare Endpoint（默认 2408），无需在服务器上放行入站 UDP。
+
+Realm 的每条转发规则都使用自定义监听端口，需要在**中转机**放行规则对应的 TCP/UDP 端口，并在**落地机**放行落地端口（允许中转机 IP 访问）。脚本不会自动修改云安全组；本机 ufw / firewalld 可通过 `realm fw <端口>` 放行。
 
 ## BBR 与网络优化
 
@@ -382,7 +462,7 @@ WireProxy 仅监听 `127.0.0.1` 时无需放行端口；监听 `0.0.0.0` 时需�
 - `/etc/sysctl.d/99-network-bbr.conf`
 - `/etc/security/limits.d/99-nofile.conf`
 
-启用 `fq` + `bbr`，并调整 TCP 缓冲区与文件描述符上限。可通过 `xr bbr` / `sb bbr` 查看状态并重新应用。
+启用 `fq` + `bbr`，并调整 TCP 缓冲区与文件描述符上限。可通过 `xr bbr` / `sb bbr` / `realm bbr` 查看状态并重新应用。
 
 - systemd：由 `sysctl --system` 在开机时加载
 - OpenRC（Alpine）：额外写入 `/etc/local.d/99-network-bbr.start`，通过 `local` 服务开机应用；服务本身的 nofile 限制由 init 脚本中的 `rc_ulimit` 设置
@@ -398,8 +478,12 @@ xr argo uninstall  # 仅卸载 Xray 的 Argo 隧道
 sb uninstall       # 卸载 sing-box（同时清理 Argo 外部服务与 cloudflared）
 sb argo uninstall  # 仅卸载 sing-box 的 Argo
 warp uninstall     # 卸载 WireProxy-WARP
+realm update       # 更新 Realm 内核到最新版（保留规则）
+realm uninstall    # 卸载 Realm
 ```
 
 重新执行 `install_warp.sh` 时会提示是否保留现有 WARP 账户和端口设置，选择保留即可只更新 WireProxy / wgcf 程序。
+
+重新执行 `install_realm.sh` 或 `realm install` 时也会提示是否保留现有转发规则，选择保留即可只更新 Realm 内核。
 
 Xray 使用固定版本 `v26.6.27`，如需升级请修改脚本顶部的 `XRAY_VERSION` 后重新执行安装。
