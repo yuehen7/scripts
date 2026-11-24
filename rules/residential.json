@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "domain_suffix": [
+        "claude.ai",
+        "claude.com",
+        "clau.de",
+        "anthropic.com",
+        "claudeusercontent.com",
+        "claudemcpcontent.com",
+        "modelcontextprotocol.io",
+        "sentry.io",
+        "datadoghq.com",
+        "growthbook.io",
+        "usefathom.com",
+        "segment.io",
+        "siftscience.com",
+        "hcaptcha.com",
+        "challenges.cloudflare.com",
+        "intercom.io",
+        "intercomcdn.com",
+        "stripe.com",
+        "stripe.network",
+        "stripecdn.com",
+        "withpersona.com",
+        "google.com",
+        "googleapis.com",
+        "gstatic.com",
+        "googleusercontent.com",
+        "gmail.com",
+        "recaptcha.net",
+        "webshare.io",
+        "ipinfo.io"
+      ],
+      "domain_keyword": [
+        "anthropic",
+        "claude",
+        "browser-intake"
+      ]
+    }
+  ]
+}

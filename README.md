@@ -203,14 +203,22 @@ sb argo uninstall  # 仅卸载 Argo 外部服务与状态
 2. 选择代理类型：HTTP 或 SOCKS5
 3. 输入代理地址：`host:port`（兼容 `http://`、`socks5://` 前缀）
 4. 输入用户名和密码（**均可留空**，无认证代理直接回车）
+5. 选择出站模式：
+   - **全局**（默认）：所有流量都从住宅 IP 出站
+   - **规则**：仅规则集中的域名从住宅 IP 出站，其余流量直连
 
-启用后：
+规则模式使用仓库中的共享规则集 [`rules/residential.json`](rules/residential.json)（sing-box source 格式），当前包含 Claude / Anthropic、监控风控、支付验证、Google 以及出口 IP 检测等域名：
 
-- 该代理作为默认出站，未被拦截规则命中的流量都从住宅 IP 出站
-- Xray 会额外把 53 端口 DNS 查询固定为直连，避免 DNS 走 HTTP/SOCKS 代理失败
-- sing-box 的 `route.final` 会指向该住宅代理
-- `xr info` / `sb info` 会显示当前住宅代理的类型、地址与认证信息
+- Xray 会将其转换为内联的 `domain:` / `keyword:` 路由规则，并把默认出站恢复为直连
+- sing-box 会将其转换为 `domain_suffix` / `domain_keyword` 路由规则，并把 `route.final` 设为直连
+- 生成配置时优先从 GitHub 拉取规则集，并缓存到 `/etc/xray/residential-rules.json` 或 `/etc/sing-box/residential-rules.json`；拉取失败且无缓存时会中止生成，避免静默降级
+
+其他行为：
+
+- 全局模式下，Xray 会把 53 端口 DNS 查询固定为直连，避免 DNS 走 HTTP/SOCKS 代理失败
+- `xr info` / `sb info` 会显示当前住宅代理的类型、地址、认证信息、出站模式以及规则条数
 - 重新执行 `xr gen` / `sb gen` 会重新询问并覆盖现有出站配置
+- 修改 `rules/residential.json` 后重新执行 `xr gen` / `sb gen` 即可生效（规则集在生成时拉取）
 
 ## WireProxy-WARP
 

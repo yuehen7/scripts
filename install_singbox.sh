@@ -26,6 +26,9 @@ CONFIG_DIR="/etc/sing-box"
 CERT_DIR="${CONFIG_DIR}/cert"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 LINKS_FILE="${CONFIG_DIR}/links.txt"
+# 住宅 IP 出站规则集（sing-box source 格式，Xray / sing-box 共用同一份源文件）
+RESIDENTIAL_RULE_URL="https://raw.githubusercontent.com/yuehen7/scripts/main/rules/residential.json"
+RESIDENTIAL_RULE_CACHE="${CONFIG_DIR}/residential-rules.json"
 SYSTEMD_FILE="/etc/systemd/system/sing-box.service"
 INITD_FILE="/etc/init.d/sing-box"
 SERVICE_NAME="sing-box"
@@ -1299,7 +1302,7 @@ render_inbound_info() {
 
     # 住宅 IP 出站
     if jq -e 'any(.outbounds[]?; .tag == "residential-out")' "$CONFIG_FILE" >/dev/null 2>&1; then
-        local proxy_type proxy_server proxy_port proxy_user proxy_pass proxy_type_display
+        local proxy_type proxy_server proxy_port proxy_user proxy_pass proxy_type_display mode_display
         proxy_type=$(jq -r '.outbounds[] | select(.tag=="residential-out") | .type' "$CONFIG_FILE")
         proxy_server=$(jq -r '.outbounds[] | select(.tag=="residential-out") | .server' "$CONFIG_FILE")
         proxy_port=$(jq -r '.outbounds[] | select(.tag=="residential-out") | .server_port' "$CONFIG_FILE")
@@ -1310,8 +1313,12 @@ render_inbound_info() {
         else
             proxy_type_display="SOCKS5"
         fi
+        mode_display="全局"
+        if jq -e 'any(.route.rules[]?; .outbound == "residential-out")' "$CONFIG_FILE" >/dev/null 2>&1; then
+            mode_display="规则分流"
+        fi
 
-        echo -e "${GREEN}【出站: 住宅 IP 代理（默认出站）】${PLAIN}"
+        echo -e "${GREEN}【出站: 住宅 IP 代理（${mode_display}）】${PLAIN}"
         echo -e "  类型:   ${CYAN}${proxy_type_display}${PLAIN}"
         echo -e "  地址:   ${CYAN}${proxy_server}:${proxy_port}${PLAIN}"
         if [[ -n "$proxy_user" ]]; then
@@ -1319,6 +1326,11 @@ render_inbound_info() {
             echo -e "  密码:   ${CYAN}${proxy_pass:-<空>}${PLAIN}"
         else
             echo -e "  认证:   ${CYAN}无${PLAIN}"
+        fi
+        if [[ "$mode_display" == "规则分流" ]]; then
+            local res_rule_count
+            res_rule_count=$(jq '[.route.rules[]? | select(.outbound == "residential-out") | ((.domain_suffix // []) + (.domain_keyword // [])) | length] | add // 0' "$CONFIG_FILE")
+            echo -e "  规则:   ${CYAN}${res_rule_count} 条域名/关键字${PLAIN}"
         fi
         echo -e "----------------------------------------------------------------"
     fi
@@ -1493,6 +1505,24 @@ parse_proxy_address() {
     return 0
 }
 
+# 获取住宅 IP 出站规则集：优先远程拉取，失败时回退本地缓存
+load_residential_rules() {
+    local tmp rc=1
+    tmp=$(mktemp) || return 1
+    if curl -fsSL --connect-timeout 5 --max-time 15 "$RESIDENTIAL_RULE_URL" -o "$tmp" 2>/dev/null \
+        && jq -e '.rules | type == "array" and length > 0' "$tmp" >/dev/null 2>&1; then
+        cp "$tmp" "$RESIDENTIAL_RULE_CACHE" 2>/dev/null || true
+        RESIDENTIAL_RULES=$(cat "$tmp")
+        rc=0
+    elif [[ -f "$RESIDENTIAL_RULE_CACHE" ]] \
+        && jq -e '.rules | type == "array" and length > 0' "$RESIDENTIAL_RULE_CACHE" >/dev/null 2>&1; then
+        RESIDENTIAL_RULES=$(cat "$RESIDENTIAL_RULE_CACHE")
+        rc=0
+    fi
+    rm -f "$tmp"
+    return $rc
+}
+
 # 配置住宅 IP 出站（可选）
 configure_residential_outbound() {
     RESIDENTIAL_ENABLED=0
@@ -1501,9 +1531,10 @@ configure_residential_outbound() {
     RESIDENTIAL_PORT=""
     RESIDENTIAL_USER=""
     RESIDENTIAL_PASS=""
+    RESIDENTIAL_MODE="global"
 
     local use_proxy
-    read -rp "是否启用住宅 IP 出站（启用后默认流量从代理出站）？[y/N]: " use_proxy </dev/tty || return 0
+    read -rp "是否启用住宅 IP 出站（可选择全局或规则分流）？[y/N]: " use_proxy </dev/tty || return 0
     if [[ ! "$use_proxy" =~ ^[Yy]([Ee][Ss])?$ ]]; then
         echo -e "${YELLOW}未启用住宅 IP 出站，流量将直接出站。${PLAIN}"
         return 0
@@ -1542,10 +1573,25 @@ configure_residential_outbound() {
         RESIDENTIAL_PASS=""
     fi
 
+    local mode_choice
+    echo -e "${CYAN}请选择住宅 IP 出站模式：${PLAIN}"
+    echo -e "  ${GREEN}1)${PLAIN} 全局：所有流量都从住宅 IP 出站"
+    echo -e "  ${GREEN}2)${PLAIN} 规则：仅 Claude / Google / 支付等指定域名从住宅 IP 出站，其余直连"
+    while true; do
+        read -rp "请输入编号 [1-2，默认 1]: " mode_choice </dev/tty || return 0
+        case "$mode_choice" in
+            ""|1|global) RESIDENTIAL_MODE="global"; break ;;
+            2|rule) RESIDENTIAL_MODE="rule"; break ;;
+            *) echo -e "${RED}输入无效，请输入 1 或 2。${PLAIN}" ;;
+        esac
+    done
+
     RESIDENTIAL_ENABLED=1
     local type_display="SOCKS5"
     [[ "$RESIDENTIAL_TYPE" == "http" ]] && type_display="HTTP"
-    echo -e "${GREEN}已启用住宅 IP 出站：${type_display} ${RESIDENTIAL_HOST}:${RESIDENTIAL_PORT}${PLAIN}"
+    local mode_display="全局"
+    [[ "$RESIDENTIAL_MODE" == "rule" ]] && mode_display="规则分流"
+    echo -e "${GREEN}已启用住宅 IP 出站：${type_display} ${RESIDENTIAL_HOST}:${RESIDENTIAL_PORT}（${mode_display}）${PLAIN}"
 }
 
 # 按用户选择的协议生成入站、嗅探与基础拦截规则的配置
@@ -1560,6 +1606,10 @@ generate_production_config() {
     select_inbound_protocols || return 1
     configure_inbound_ports
     configure_residential_outbound
+    if [[ $RESIDENTIAL_ENABLED -eq 1 && "$RESIDENTIAL_MODE" == "rule" ]] && ! load_residential_rules; then
+        echo -e "${RED}无法获取住宅 IP 规则集（远程下载失败且无本地缓存），请检查网络后重试，或改用全局模式。${PLAIN}"
+        return 1
+    fi
 
     # 每次生成配置都使用随机 WS 路径，避免固定路径指纹
     if [[ $ENABLE_VMESS -eq 1 ]]; then
@@ -1855,10 +1905,12 @@ generate_production_config() {
             }]' <<<"$inbounds") || return 1
     fi
 
-    # 出站：启用住宅 IP 时作为默认出站
+    # 出站：全局模式下住宅 IP 为默认出站；规则模式下默认直连，由路由规则分流
     local outbounds final_outbound="direct"
     if [[ $RESIDENTIAL_ENABLED -eq 1 ]]; then
-        final_outbound="residential-out"
+        if [[ "$RESIDENTIAL_MODE" != "rule" ]]; then
+            final_outbound="residential-out"
+        fi
         local has_auth=0
         [[ -n "$RESIDENTIAL_USER" ]] && has_auth=1
         outbounds=$(jq -cn \
@@ -1881,7 +1933,20 @@ generate_production_config() {
         outbounds='[{"type":"direct","tag":"direct"}]'
     fi
 
-    if ! jq -n --argjson inbounds "$inbounds" --argjson outbounds "$outbounds" --arg final "$final_outbound" --argjson argo_named "$argo_named" '{
+    # 规则集转换为 sing-box 的 domain_suffix / domain_keyword
+    local res_suffix='[]' res_keyword='[]'
+    if [[ $RESIDENTIAL_ENABLED -eq 1 && "$RESIDENTIAL_MODE" == "rule" ]]; then
+        res_suffix=$(jq -c '[.rules[].domain_suffix[]?]' <<<"$RESIDENTIAL_RULES") || return 1
+        res_keyword=$(jq -c '[.rules[].domain_keyword[]?]' <<<"$RESIDENTIAL_RULES") || return 1
+        if [[ $(jq -n --argjson a "$res_suffix" --argjson b "$res_keyword" '($a + $b) | length') -eq 0 ]]; then
+            echo -e "${RED}住宅 IP 规则集为空，无法启用规则模式。${PLAIN}"
+            return 1
+        fi
+    fi
+
+    if ! jq -n --argjson inbounds "$inbounds" --argjson outbounds "$outbounds" --arg final "$final_outbound" \
+        --argjson argo_named "$argo_named" --arg mode "$RESIDENTIAL_MODE" \
+        --argjson res_suffix "$res_suffix" --argjson res_keyword "$res_keyword" '{
       "log": {
         "disabled": false,
         "level": "info",
@@ -1914,7 +1979,14 @@ generate_production_config() {
             "ip_is_private": true,
             "action": "reject"
           }
-        ]),
+        ] + (if $mode == "rule" then [
+          ({
+            "action": "route",
+            "outbound": "residential-out"
+          }
+          + (if ($res_suffix | length) > 0 then {"domain_suffix": $res_suffix} else {} end)
+          + (if ($res_keyword | length) > 0 then {"domain_keyword": $res_keyword} else {} end))
+        ] else [] end)),
         "rule_set": [
           {
             "type": "remote",
